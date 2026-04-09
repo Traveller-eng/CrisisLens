@@ -1,0 +1,13 @@
+node_modules
+dist
+.firebase
+.idea
+.vscode
+*.log
+.env
+.env.local
+web/.env
+web/.env.local
+functions/lib
+functions/.env
+

@@ -1,0 +1,48 @@
+{
+  "emulators": {
+    "functions": {
+      "host": "127.0.0.1",
+      "port": 5005
+    },
+    "firestore": {
+      "host": "127.0.0.1",
+      "port": 8085
+    },
+    "ui": {
+      "enabled": true,
+      "port": 4005
+    },
+    "hub": {
+      "port": 4405
+    },
+    "logging": {
+      "port": 4505
+    },
+    "eventarc": {
+      "port": 9305
+    },
+    "tasks": {
+      "port": 9505
+    }
+  },
+  "functions": {
+    "source": "functions"
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "hosting": {
+    "public": "web/dist",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  }
+}
