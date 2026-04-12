@@ -1,11 +1,14 @@
 import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { addDoc, collection, doc, onSnapshot, orderBy, query } from "firebase/firestore";
+import { httpsCallable } from "firebase/functions";
 import { buildRecommendations, buildZoneClusters } from "../../shared/decision";
 import { demoReports, demoResources } from "../../shared/demo-data";
-import type { CrisisReport, Recommendation, ScoredReport, ZoneCluster } from "../../shared/crisis";
+import type { AIAnalysis, CrisisReport, Recommendation, ScoredReport, ZoneCluster } from "../../shared/crisis";
+import { clamp, decide, fuseConfidence } from "../../shared/fusion";
 import { appConfig, setupChecklist } from "./config";
-import { db, firebaseEnabled } from "./lib/firebase";
+import { db, firebaseEnabled, functionsClient } from "./lib/firebase";
 import { normalizeReport } from "./lib/live-reports";
+import AIPanel from "./components/AIPanel";
 
 const LiveMap = lazy(() => import("./components/LiveMap"));
 
@@ -55,6 +58,22 @@ type WeatherSignal = {
   timestamp: number;
   windDeg?: number;
 };
+
+type SimulationProfile = {
+  zone: string;
+  sourceType: CrisisReport["sourceType"];
+  type: CrisisReport["geminiOutput"]["type"];
+  tone: CrisisReport["geminiOutput"]["tone"];
+  urgency: number;
+  text: string;
+  contradictionSignals: number;
+  claim: NonNullable<CrisisReport["claim"]>;
+  baseCoords: { lat: number; lng: number };
+};
+
+const analyzeReportCallable = functionsClient
+  ? httpsCallable<{ text: string }, AIAnalysis>(functionsClient, "analyzeReport")
+  : null;
 
 type ScenarioKey = "flood" | "earthquake" | "cyclone" | "custom";
 
@@ -164,6 +183,154 @@ function buildFeedEvents(): FeedEvent[] {
   return [...systemEvents, ...reportEvents].sort((a, b) => (b.minute ?? 0) - (a.minute ?? 0));
 }
 
+function mapAiTypeToCrisisType(type: AIAnalysis["type"]): CrisisReport["geminiOutput"]["type"] {
+  if (type === "earthquake" || type === "fire" || type === "infrastructure") {
+    return "infrastructure";
+  }
+
+  if (type === "injury") {
+    return "injury";
+  }
+
+  if (type === "shelter" || type === "supply") {
+    return "shelter";
+  }
+
+  return "flood";
+}
+
+function mapAiNeeds(type: AIAnalysis["type"]): CrisisReport["geminiOutput"]["needs"] {
+  if (type === "earthquake") {
+    return ["medical", "rescue"];
+  }
+
+  if (type === "fire") {
+    return ["rescue", "shelter"];
+  }
+
+  if (type === "injury") {
+    return ["medical"];
+  }
+
+  if (type === "shelter" || type === "supply") {
+    return ["shelter", "food"];
+  }
+
+  return ["rescue"];
+}
+
+function mergeAiAnalysis(report: CrisisReport, ai: AIAnalysis): CrisisReport {
+  return {
+    ...report,
+    ai,
+    claim: ai.claim,
+    contradictionSignals: ai.claim === "negative" ? Math.max(report.contradictionSignals ?? 0, 1) : report.contradictionSignals,
+    geminiOutput: {
+      ...report.geminiOutput,
+      type: mapAiTypeToCrisisType(ai.type),
+      urgency: Number(ai.severity.toFixed(2)),
+      needs: mapAiNeeds(ai.type),
+      tone: report.sourceType === "anonymous" && ai.claim === "negative" ? "exaggerated" : report.geminiOutput.tone
+    }
+  };
+}
+
+function reportDedupKey(report: CrisisReport): string {
+  return `${report.zone}|${report.sourceType}|${report.text.trim().toLowerCase().replace(/\s+/g, " ")}`;
+}
+
+function dedupeReports(existing: CrisisReport[], incoming: CrisisReport[]): CrisisReport[] {
+  const seen = new Map<string, number>();
+
+  [...existing, ...incoming].forEach((report) => {
+    const key = reportDedupKey(report);
+    const time = new Date(report.timestamp).getTime();
+    const previous = seen.get(key);
+    if (previous === undefined || Math.abs(time - previous) > 30000) {
+      seen.set(key, time);
+    }
+  });
+
+  const accepted: CrisisReport[] = [];
+  const acceptedTimes = new Map<string, number>();
+
+  [...existing, ...incoming]
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+    .forEach((report) => {
+      const key = reportDedupKey(report);
+      const time = new Date(report.timestamp).getTime();
+      const previous = acceptedTimes.get(key);
+      if (previous !== undefined && Math.abs(time - previous) <= 30000) {
+        return;
+      }
+
+      acceptedTimes.set(key, time);
+      accepted.push(report);
+    });
+
+  return accepted;
+}
+
+function simulationProfile(index: number, scenario: ScenarioKey): SimulationProfile | null {
+  if (scenario !== "flood") {
+    return null;
+  }
+
+  const phase = index % 12;
+
+  if (phase <= 3) {
+    return {
+      zone: "Zone A",
+      sourceType: phase === 3 ? "verified_org" : "ngo",
+      type: "flood" as const,
+      tone: "factual" as const,
+      urgency: 0.74 + phase * 0.05,
+      text: ["Water rising fast near homes", "Floodwater entering streets near shelters", "Rescue support needed for stranded families", "Verified NGO update: rescue boats needed in Zone A"][phase],
+      contradictionSignals: 0,
+      claim: "positive" as const,
+      baseCoords: { lat: 13.0827, lng: 80.2707 }
+    };
+  }
+
+  if (phase <= 8) {
+    const slot = phase - 4;
+    return {
+      zone: "Zone B",
+      sourceType: slot === 4 ? "verified_org" : "anonymous",
+      type: "infrastructure" as const,
+      tone: slot >= 2 ? "exaggerated" as const : "emotional" as const,
+      urgency: 0.48 + slot * 0.08,
+      text:
+        ["Airport flooded, 400 stranded", "Bridge collapsed, total access lost", "People trapped near airport approach", "Runway underwater and unusable", "Verified correction: airport operational, no flooding observed"][slot],
+      contradictionSignals: slot === 4 ? 0 : 2,
+      claim: slot === 4 ? ("negative" as const) : ("negative" as const),
+      baseCoords: { lat: 13.1986, lng: 80.1692 }
+    };
+  }
+
+  const slot = phase - 9;
+  return {
+    zone: "Zone C",
+    sourceType: slot === 2 ? "ngo" : "anonymous",
+    type: slot === 2 ? ("shelter" as const) : ("flood" as const),
+    tone: slot === 2 ? ("factual" as const) : ("emotional" as const),
+    urgency: slot === 2 ? 0.54 : 0.38 + slot * 0.05,
+    text: ["Rumor: dam burst approaching Zone C", "Unconfirmed surge report spreading online", "NGO field note: minor waterlogging only, no evacuation yet"][slot],
+    contradictionSignals: slot === 2 ? 0 : 2,
+    claim: slot === 2 ? ("positive" as const) : ("negative" as const),
+    baseCoords: { lat: 13.056, lng: 80.245 }
+  };
+}
+
+function buildConfidenceStory(zone: DerivedZone | null, report: ScoredReport | null): string {
+  if (!zone || !report) {
+    return "Confidence breakdown appears when a zone and report are selected.";
+  }
+
+  const conflictDrag = Math.max(0, report.trust.decayedTrust + zone.nasaConfidence - zone.finalConfidence);
+  return `Trust input ${report.trust.decayedTrust.toFixed(2)}${zone.nasaConfirmed ? ` + NASA ${zone.nasaConfidence.toFixed(2)}` : " + NASA 0.00"} - conflict drag ${conflictDrag.toFixed(2)} = final ${zone.finalConfidence.toFixed(2)}.`;
+}
+
 function useSimulationClock() {
   const [minute, setMinute] = useState(0);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -257,6 +424,28 @@ function getActiveState(minute: number, scenario: ScenarioKey) {
 }
 
 function generateSimulationReport(index: number, scenario: ScenarioKey, elapsedSeconds: number): CrisisReport {
+  const profile = simulationProfile(index, scenario);
+  if (profile) {
+    return {
+      id: `sim-${scenario}-${index}-${Date.now()}`,
+      text: profile.text,
+      source: profile.sourceType === "verified_org" ? "Verified Command" : profile.sourceType === "ngo" ? "NGO Field Desk" : `Crowd Reporter ${index}`,
+      sourceType: profile.sourceType,
+      lat: Number((profile.baseCoords.lat + ((index % 5) - 2) * 0.0016).toFixed(6)),
+      lng: Number((profile.baseCoords.lng + ((index % 7) - 3) * 0.0014).toFixed(6)),
+      zone: profile.zone,
+      timestamp: new Date(simulationStart.getTime() + elapsedSeconds * 1000).toISOString(),
+      geminiOutput: {
+        type: profile.type,
+        urgency: Number(profile.urgency.toFixed(2)),
+        needs: profile.type === "shelter" ? ["shelter", "food"] : profile.type === "infrastructure" ? ["rescue"] : ["rescue", "medical"],
+        tone: profile.tone
+      },
+      contradictionSignals: profile.contradictionSignals,
+      claim: profile.claim
+    };
+  }
+
   const scenarioZones: Record<ScenarioKey, string[]> = {
     flood: ["Zone A", "Zone B", "Zone C"],
     earthquake: ["Zone E", "Zone F", "Zone G"],
@@ -337,7 +526,7 @@ export default function App() {
   );
   const [chaosPending, setChaosPending] = useState(false);
   const [generatorPending, setGeneratorPending] = useState(false);
-  const [expandedAction, setExpandedAction] = useState<"crowd" | "verified" | "misinfo" | null>("crowd");
+  const [expandedAction, setExpandedAction] = useState<"crowd" | "verified" | "misinfo" | null>(null);
   const [showNasaLayer, setShowNasaLayer] = useState(false);
   const [nasaHotspots, setNasaHotspots] = useState<NasaHotspot[]>([]);
   const [nasaLoading, setNasaLoading] = useState(false);
@@ -353,6 +542,7 @@ export default function App() {
   const [decisionShiftZone, setDecisionShiftZone] = useState<string | null>(null);
   const pipelineTimersRef = useRef<number[]>([]);
   const previousRecommendationRef = useRef<string>("");
+  const analysisInFlightRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     if (!firebaseEnabled || !db) {
@@ -475,16 +665,26 @@ export default function App() {
           reports: zone.reports.map((report) => report.id),
           trustScore: zone.trustScore,
           urgencyScore: zone.urgencyScore,
-          finalConfidence: zone.trustScore,
+          finalConfidence: 0,
           conflictScore: Math.min(1, zone.reports.filter((report) => report.contradictionSignals && report.contradictionSignals > 0).length / Math.max(1, zone.reports.length)),
           reportConfidence: zone.trustScore,
           nasaConfidence: showNasaLayer ? 0.62 : 0,
           nasaConfirmed: showNasaLayer,
-          decision: zone.trustScore > 0.75 ? "DISPATCH" : zone.trustScore > 0.5 ? "VERIFY" : "HOLD",
+          decision: "HOLD" as const,
           needs: zone.dominantNeeds,
           conflictLevel: zone.trustScore < 0.45 ? "HIGH" : zone.trustScore < 0.75 ? "MEDIUM" : "LOW",
           affectedEstimate: zone.affectedEstimate
-        }));
+        }))
+      .map((zone) => {
+        const finalConfidence = fuseConfidence(zone.reportConfidence, zone.nasaConfidence, zone.conflictScore, zone.nasaConfirmed);
+        const decision = zone.conflictScore > 0.6 && finalConfidence < 0.55 ? "HOLD" : decide(finalConfidence);
+        return {
+          ...zone,
+          finalConfidence,
+          decision,
+          conflictLevel: zone.conflictScore > 0.6 ? "HIGH" : zone.conflictScore > 0.3 ? "MEDIUM" : "LOW"
+        };
+      });
   const visibleMapZones =
     truthMode === "filtered"
       ? mapZones.filter((zone) => zone.finalConfidence >= 0.45 || zone.conflictLevel === "HIGH" || zone.nasaConfirmed)
@@ -524,6 +724,7 @@ export default function App() {
   const conflictZones = mapZones.filter((zone) => zone.conflictLevel === "HIGH");
   const highTrustZones = mapZones.filter((zone) => zone.finalConfidence >= 0.75);
   const topTrustScore = selectedDerivedZone?.finalConfidence ?? recommendations[0]?.confidence ?? 0;
+  const confidenceStory = buildConfidenceStory(selectedDerivedZone, selectedReport);
 
   useEffect(() => {
     const signature = recommendations.map((item) => `${item.zone}:${item.action}:${item.confidence.toFixed(2)}`).join("|");
@@ -564,7 +765,7 @@ export default function App() {
       return;
     }
 
-    const seededReports = Array.from({ length: 4 }, (_, index) => generateSimulationReport(index + 1, scenario, index + 1));
+    const seededReports = Array.from({ length: 6 }, (_, index) => generateSimulationReport(index + 1, scenario, (index + 1) * 8));
     setSimulationReports(seededReports);
     setSimulationIndex(seededReports.length);
     const seedEvent: FeedEvent = {
@@ -610,12 +811,57 @@ export default function App() {
     return () => window.clearInterval(generator);
   }, [usingLiveReports, isPlaying, scenario, speed, minute]);
 
+  useEffect(() => {
+    if (usingLiveReports || !analyzeReportCallable) {
+      return;
+    }
+
+    const pendingReport =
+      [...simulationReports, ...localReports].find(
+        (report) => !report.ai && !analysisInFlightRef.current.has(report.id)
+      ) ?? null;
+
+    if (!pendingReport) {
+      return;
+    }
+
+    analysisInFlightRef.current.add(pendingReport.id);
+
+    void analyzeReportCallable({ text: pendingReport.text })
+      .then((result) => {
+        const ai = result.data;
+        setSimulationReports((current) =>
+          current.map((report) => (report.id === pendingReport.id ? mergeAiAnalysis(report, ai) : report))
+        );
+        setLocalReports((current) =>
+          current.map((report) => (report.id === pendingReport.id ? mergeAiAnalysis(report, ai) : report))
+        );
+        pushLocalEvent({
+          id: `ai-${pendingReport.id}`,
+          label: "AI analysis complete",
+          detail: `${pendingReport.zone} | ${ai.type} | claim ${ai.claim} | confidence ${ai.confidence.toFixed(2)}`,
+          tone: ai.claim === "negative" ? "alert" : "resolve"
+        });
+      })
+      .catch(() => {
+        pushLocalEvent({
+          id: `ai-error-${pendingReport.id}`,
+          label: "AI analysis unavailable",
+          detail: `${pendingReport.zone} stayed on heuristic triage because Gemini did not respond`,
+          tone: "alert"
+        });
+      })
+      .finally(() => {
+        analysisInFlightRef.current.delete(pendingReport.id);
+      });
+  }, [localReports, simulationReports, usingLiveReports]);
+
   function pushLocalEvent(event: FeedEvent) {
     setLocalEvents((current) => [event, ...current].slice(0, 16));
   }
 
   function pushLocalReports(reports: CrisisReport[]) {
-    setLocalReports((current) => [...current, ...reports]);
+    setLocalReports((current) => dedupeReports(current, reports));
   }
 
   async function toggleNasaLayer() {
@@ -978,9 +1224,7 @@ export default function App() {
       <header className="topbar">
         <div className="topbar__brand">
           <h1>CrisisLens</h1>
-          <p className="topbar__summary">
-            AI-powered decision intelligence for disaster response under uncertainty, built to suppress misinformation and prioritize trusted action.
-          </p>
+          <p className="topbar__summary">Trust-filtered crisis intelligence for fast, evidence-backed decisions.</p>
         </div>
 
         <div className="topbar__controls">
@@ -1043,72 +1287,6 @@ export default function App() {
               </button>
             </div>
           </div>
-
-          <div className="control-cluster control-cluster--actions">
-            <span className="control-label">Interventions</span>
-            <div className="action-tabs">
-              <button
-                className={`action-tab ${expandedAction === "crowd" ? "action-tab--active" : ""}`}
-                disabled={generatorPending}
-                onClick={() => {
-                  setExpandedAction("crowd");
-                  void injectLocalSyntheticWave();
-                }}
-                type="button"
-              >
-                <span className="action-tab__icon">~</span>
-                <strong>Crowd</strong>
-              </button>
-              <button
-                className={`action-tab ${expandedAction === "verified" ? "action-tab--active" : ""}`}
-                disabled={generatorPending}
-                onClick={() => {
-                  setExpandedAction("verified");
-                  void injectVerifiedCorrectionFromUi();
-                }}
-                type="button"
-              >
-                <span className="action-tab__icon">+</span>
-                <strong>Verified</strong>
-              </button>
-              <button
-                className={`action-tab action-tab--danger ${expandedAction === "misinfo" ? "action-tab--active" : ""}`}
-                disabled={chaosPending}
-                onClick={() => {
-                  setExpandedAction("misinfo");
-                  void injectChaos();
-                }}
-                type="button"
-              >
-                <span className="action-tab__icon">!</span>
-                <strong>Misinfo</strong>
-              </button>
-            </div>
-            {expandedAction === "crowd" ? (
-              <div className="action-panel">
-                <p>Inject a burst of noisy public reports into active zones.</p>
-                <button className="control-button topbar-runner" disabled={generatorPending} onClick={injectLocalSyntheticWave} type="button">
-                  Run Crowd Wave
-                </button>
-              </div>
-            ) : null}
-            {expandedAction === "verified" ? (
-              <div className="action-panel">
-                <p>Add a high-trust correction so the system can recover.</p>
-                <button className="control-button topbar-runner" disabled={generatorPending} onClick={injectVerifiedCorrectionFromUi} type="button">
-                  Run Verified Report
-                </button>
-              </div>
-            ) : null}
-            {expandedAction === "misinfo" ? (
-              <div className="action-panel">
-                <p>Force a contradiction-heavy moment and watch trust shift live.</p>
-                <button className="control-button control-button--chaos topbar-runner" disabled={chaosPending} onClick={injectChaos} type="button">
-                  {chaosPending ? "Injecting..." : "Run Misinformation"}
-                </button>
-              </div>
-            ) : null}
-          </div>
         </div>
       </header>
 
@@ -1121,6 +1299,7 @@ export default function App() {
         <StatusPill label={weatherLayerOn ? `Weather ${weatherSignals.length}` : "Weather off"} ready={weatherLayerOn} />
         <StatusPill label={`Verified ${highTrustZones.length}`} ready />
         <StatusPill label={`Conflict ${conflictZones.length}`} ready={conflictZones.length === 0} />
+        <StatusPill label={`Suppressed ${activeReports.filter((report) => (report.claim ?? "positive") === "negative").length}`} ready={false} />
         <StatusPill label={`Trust ${topTrustScore.toFixed(2)}`} ready={topTrustScore >= 0.75} />
         <StatusPill label="Gemini" ready={setupChecklist.hasGeminiKey} />
         <StatusPill label="Maps" ready={setupChecklist.hasMapsKey} />
@@ -1160,6 +1339,64 @@ export default function App() {
 
       <section className="trigger-strip">
         <div className="trigger-card">
+          <span className="mission-label">Interventions</span>
+          <h3>Stress The System</h3>
+          <p>Inject crowd noise, verified correction, or misinformation without bloating the command bar.</p>
+          <div className="action-tabs">
+            <button
+              className={`action-tab ${expandedAction === "crowd" ? "action-tab--active" : ""}`}
+              disabled={generatorPending}
+              onClick={() => setExpandedAction((current) => (current === "crowd" ? null : "crowd"))}
+              type="button"
+            >
+              <span className="action-tab__icon">~</span>
+              <strong>Crowd</strong>
+            </button>
+            <button
+              className={`action-tab ${expandedAction === "verified" ? "action-tab--active" : ""}`}
+              disabled={generatorPending}
+              onClick={() => setExpandedAction((current) => (current === "verified" ? null : "verified"))}
+              type="button"
+            >
+              <span className="action-tab__icon">+</span>
+              <strong>Verified</strong>
+            </button>
+            <button
+              className={`action-tab action-tab--danger ${expandedAction === "misinfo" ? "action-tab--active" : ""}`}
+              disabled={chaosPending}
+              onClick={() => setExpandedAction((current) => (current === "misinfo" ? null : "misinfo"))}
+              type="button"
+            >
+              <span className="action-tab__icon">!</span>
+              <strong>Misinfo</strong>
+            </button>
+          </div>
+          {expandedAction === "crowd" ? (
+            <div className="action-panel">
+              <p>Inject a burst of noisy public reports into active zones.</p>
+              <button className="control-button topbar-runner" disabled={generatorPending} onClick={injectLocalSyntheticWave} type="button">
+                Run Crowd Wave
+              </button>
+            </div>
+          ) : null}
+          {expandedAction === "verified" ? (
+            <div className="action-panel">
+              <p>Add a high-trust correction so the system can recover.</p>
+              <button className="control-button topbar-runner" disabled={generatorPending} onClick={injectVerifiedCorrectionFromUi} type="button">
+                Run Verified Report
+              </button>
+            </div>
+          ) : null}
+          {expandedAction === "misinfo" ? (
+            <div className="action-panel">
+              <p>Force a contradiction-heavy moment and watch trust shift live.</p>
+              <button className="control-button control-button--chaos topbar-runner" disabled={chaosPending} onClick={injectChaos} type="button">
+                {chaosPending ? "Injecting..." : "Run Misinformation"}
+              </button>
+            </div>
+          ) : null}
+        </div>
+        <div className="trigger-card">
           <span className="mission-label">Reality Layer</span>
           <h3>GDACS Trigger Ready</h3>
           <p>
@@ -1180,8 +1417,8 @@ export default function App() {
         </div>
         <div className="metric-banner">
           <span className="mission-label">Killer Metric</span>
-          <strong>False-signal impact reduced by 40%</strong>
-          <p>Simulated Chennai flood conditions with verified correction and contradiction-aware ranking.</p>
+          <strong>False-signal suppression measured in adversarial tests</strong>
+          <p>Run the fusion suite to cite the exact percentage from real suppression scenarios instead of a made-up demo number.</p>
         </div>
       </section>
 
@@ -1307,7 +1544,11 @@ export default function App() {
                 className={`pipeline-card ${activePipeline?.stage === index ? "pipeline-card--active" : ""}`}
               >
                 <span className="pipeline-card__title">{step.title}</span>
-                <p>{step.text}</p>
+                <p>
+                  {activePipeline?.stage === index
+                    ? `${step.text} Active: ${activePipeline.report.zone} · ${activePipeline.report.geminiOutput.type} · ${activePipeline.report.sourceType}.`
+                    : step.text}
+                </p>
               </article>
             ))}
           </div>
@@ -1338,6 +1579,20 @@ export default function App() {
               <em>{selectedDerivedZone?.nasaConfirmed ? "Satellite confirmed" : "No satellite layer"}</em>
             </div>
           </div>
+          <div className="detail-card detail-card--decomposition">
+            <h3>Confidence Decomposition</h3>
+            <div className="decomposition-grid">
+              <span>Trust input</span>
+              <strong>{selectedReport?.trust.decayedTrust.toFixed(2) ?? "0.00"}</strong>
+              <span>NASA boost</span>
+              <strong>+{selectedDerivedZone?.nasaConfidence.toFixed(2) ?? "0.00"}</strong>
+              <span>Conflict drag</span>
+              <strong>-{Math.max(0, ((selectedReport?.trust.decayedTrust ?? 0) + (selectedDerivedZone?.nasaConfidence ?? 0) - (selectedDerivedZone?.finalConfidence ?? 0))).toFixed(2)}</strong>
+              <span>Decay factor</span>
+              <strong>x{(Math.exp(-0.02 * (selectedReport?.trust.minutesSinceReport ?? 0))).toFixed(2)}</strong>
+            </div>
+            <p className="helper-text">{confidenceStory}</p>
+          </div>
           <div className="trust-panel-grid">
             {selectedReport ? (
               <div className="explain-layout">
@@ -1363,11 +1618,12 @@ export default function App() {
                 <div className="detail-card">
                   <h3>Why It Matters</h3>
                   <ul>
-                    {selectedReport.trust.reasons.map((reason) => (
+                    {[...(selectedReport.ai?.reasoning ? [selectedReport.ai.reasoning] : []), ...selectedReport.trust.reasons].slice(0, 5).map((reason) => (
                       <li key={reason}>{reason}</li>
                     ))}
                   </ul>
                 </div>
+                <AIPanel data={selectedReport.ai} />
               </div>
             ) : null}
           </div>
@@ -1484,6 +1740,10 @@ function MetricCard({ label, value }: { label: string; value: string }) {
 }
 
 function displayDecisionState(decision: string): string {
+  if (decision === "MONITOR") {
+    return "MONITOR";
+  }
+
   if (decision === "VERIFY") {
     return "PARTIAL RESPONSE";
   }
@@ -1496,7 +1756,7 @@ function displayDecisionState(decision: string): string {
 }
 
 function displayDecisionAction(action: string): string {
-  return action.replace("VERIFY + LIMITED RESPONSE", "PARTIAL RESPONSE");
+  return action.replace("VERIFY + LIMITED RESPONSE", "PARTIAL RESPONSE").replace("Monitor situation", "MONITOR");
 }
 
 function trustMeterTone(value: number): "low" | "medium" | "high" {

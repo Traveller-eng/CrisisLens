@@ -1,5 +1,6 @@
 import type { CrisisReport, NeedType, Recommendation, ResourcePool, ScoredReport, ZoneCluster } from "./crisis";
 import { scoreReport } from "./trust";
+import { clamp } from "./fusion";
 
 function average(values: number[]): number {
   if (values.length === 0) {
@@ -63,42 +64,45 @@ export function buildRecommendations(
   let rank = 1;
 
   zones
-    .sort((a, b) => b.urgencyScore * b.trustScore - a.urgencyScore * a.trustScore)
+    .sort((a, b) => (0.65 * b.trustScore + 0.35 * b.urgencyScore) - (0.65 * a.trustScore + 0.35 * a.urgencyScore))
     .forEach((zone) => {
-      if (zone.trustScore < 0.45) {
+      const zoneConfidence = clamp(0.65 * zone.trustScore + 0.35 * zone.urgencyScore);
+
+      if (zone.trustScore < 0.45 || zoneConfidence < 0.45) {
         recommendations.push({
           rank: rank++,
           action: "DO NOT DISPATCH",
           zone: zone.zone,
-          confidence: Number(zone.trustScore.toFixed(2)),
-          rationale: `TrustScore ${zone.trustScore.toFixed(2)} with contradicting or low-reliability reports`,
+          confidence: Number(zoneConfidence.toFixed(2)),
+          rationale: `trust ${zone.trustScore.toFixed(2)} overwhelmed by contradiction or low reliability`,
           flag: "MISINFORMATION_RISK"
         });
         return;
       }
 
       const topNeed = zone.dominantNeeds[0] ?? "rescue";
-      let action = "Monitor situation";
+      let action = "MONITOR";
 
-      if (topNeed === "rescue" && resources.rescueBoats > 0) {
+      if (zoneConfidence >= 0.75 && topNeed === "rescue" && resources.rescueBoats > 0) {
         action = `Deploy ${Math.min(2, resources.rescueBoats)} rescue boats`;
-      } else if (topNeed === "medical" && resources.medicalTeams > 0) {
+      } else if (zoneConfidence >= 0.75 && topNeed === "medical" && resources.medicalTeams > 0) {
         action = `Send ${Math.min(1, resources.medicalTeams)} medical team`;
-      } else if (topNeed === "shelter") {
+      } else if (zoneConfidence >= 0.75 && topNeed === "shelter") {
         action = "Open emergency shelter support";
-      } else if (topNeed === "food") {
+      } else if (zoneConfidence >= 0.75 && topNeed === "food") {
         action = "Route food and relief supplies";
+      } else if (zoneConfidence >= 0.55) {
+        action = "PARTIAL RESPONSE";
       }
 
       recommendations.push({
         rank: rank++,
         action,
         zone: zone.zone,
-        confidence: Number((zone.urgencyScore * zone.trustScore).toFixed(2)),
-        rationale: `urgency ${zone.urgencyScore.toFixed(2)} x trust ${zone.trustScore.toFixed(2)}, ${zone.affectedEstimate} affected`
+        confidence: Number(zoneConfidence.toFixed(2)),
+        rationale: `trust ${zone.trustScore.toFixed(2)} · urgency ${zone.urgencyScore.toFixed(2)} · ${zone.affectedEstimate} affected`
       });
     });
 
   return recommendations;
 }
-

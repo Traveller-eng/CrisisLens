@@ -27,7 +27,7 @@ select {
 .ops-shell {
   max-width: 1520px;
   margin: 0 auto;
-  padding: 24px 18px 28px;
+  padding: 10px 18px 28px;
 }
 
 .ops-shell--truth-shift {
@@ -45,11 +45,16 @@ select {
 
 .topbar {
   border-radius: 24px;
-  padding: 20px 22px;
+  padding: 14px 18px;
   display: flex;
   justify-content: space-between;
-  gap: 18px;
-  align-items: flex-start;
+  gap: 14px;
+  align-items: start;
+}
+
+.topbar__brand {
+  flex: 1;
+  min-width: 0;
 }
 
 .eyebrow,
@@ -70,39 +75,37 @@ select {
 }
 
 .topbar h1 {
-  font-size: clamp(2.2rem, 4.4vw, 3.7rem);
+  font-size: clamp(1.8rem, 3.2vw, 2.9rem);
+  line-height: 1.02;
 }
 
 .topbar__summary {
-  max-width: 640px;
-  margin: 10px 0 0;
+  max-width: 420px;
+  margin: 8px 0 0;
   color: #bcd1e3;
-  line-height: 1.55;
+  line-height: 1.35;
+  font-size: 0.9rem;
 }
 
 .topbar__controls {
   display: grid;
-  grid-template-columns: repeat(5, minmax(130px, 1fr));
-  gap: 14px;
-  width: min(860px, 100%);
+  grid-template-columns: repeat(4, minmax(130px, 1fr));
+  gap: 10px;
+  width: min(700px, 100%);
   align-items: start;
 }
 
 .control-cluster {
   background: rgba(255, 255, 255, 0.03);
   border-radius: 18px;
-  padding: 14px;
-}
-
-.control-cluster--actions {
-  grid-column: span 2;
+  padding: 11px 12px;
 }
 
 .control-label {
   display: block;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
   color: #87a7bd;
-  font-size: 0.82rem;
+  font-size: 0.78rem;
   font-weight: 700;
 }
 
@@ -117,7 +120,7 @@ select,
 
 select {
   width: 100%;
-  padding: 10px 12px;
+  padding: 8px 10px;
 }
 
 .button-row,
@@ -131,7 +134,7 @@ select {
 
 .control-button,
 .speed-pill {
-  padding: 10px 14px;
+  padding: 8px 12px;
   cursor: pointer;
 }
 
@@ -149,16 +152,16 @@ select {
 .action-tab {
   display: grid;
   justify-items: center;
-  gap: 8px;
+  gap: 6px;
   text-align: center;
-  padding: 12px 10px;
+  padding: 10px 8px;
   border: 1px solid rgba(115, 199, 239, 0.14);
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.04);
   color: #f4f9fd;
   cursor: pointer;
   transition: transform 180ms ease, border-color 180ms ease;
-  min-height: 74px;
+  min-height: 62px;
 }
 
 .action-tab:hover {
@@ -198,8 +201,8 @@ select {
 }
 
 .action-panel {
-  margin-top: 10px;
-  padding: 12px;
+  margin-top: 8px;
+  padding: 10px;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(115, 199, 239, 0.12);
@@ -209,7 +212,7 @@ select {
   margin: 0 0 10px;
   color: #97afc2;
   line-height: 1.4;
-  font-size: 0.9rem;
+  font-size: 0.84rem;
 }
 
 .topbar-runner {
@@ -281,7 +284,7 @@ select {
 .trigger-strip {
   margin-top: 14px;
   display: grid;
-  grid-template-columns: 1.1fr 0.9fr;
+  grid-template-columns: 1fr 1fr 0.9fr;
   gap: 14px;
 }
 
@@ -343,6 +346,8 @@ select {
 
 .panel--left {
   grid-area: left;
+  display: flex;
+  flex-direction: column;
 }
 
 .panel--center {
@@ -384,7 +389,8 @@ select {
 }
 
 .intel-stream {
-  max-height: 760px;
+  min-height: 0;
+  height: 100%;
   overflow-y: auto;
   padding-right: 4px;
 }
@@ -805,7 +811,8 @@ select {
 .score-card,
 .breakdown,
 .detail-card,
-.setup-card {
+.setup-card,
+.ai-panel {
   padding: 16px;
 }
 
@@ -845,6 +852,45 @@ select {
 .detail-card ul {
   margin: 0;
   padding-left: 18px;
+}
+
+.detail-card--decomposition {
+  margin-bottom: 12px;
+}
+
+.decomposition-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 16px;
+  margin-top: 10px;
+}
+
+.decomposition-grid span {
+  color: #8ea8bc;
+}
+
+.ai-panel {
+  border: 1px solid rgba(72, 227, 161, 0.2);
+  border-radius: 18px;
+  background: rgba(2, 8, 12, 0.96);
+  color: #74ffb1;
+  font-family: "JetBrains Mono", "Consolas", monospace;
+}
+
+.ai-panel__title {
+  margin-bottom: 10px;
+  color: #f4f9fd;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+}
+
+.ai-panel pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.78rem;
+  line-height: 1.55;
 }
 
 .breakdown-row + .breakdown-row {
@@ -986,7 +1032,7 @@ select {
 
   .topbar__controls {
     width: 100%;
-    margin-top: 16px;
+    margin-top: 12px;
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

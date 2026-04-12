@@ -5,8 +5,9 @@ import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import { demoReports, demoResources } from "../../shared/demo-data";
 import { buildRecommendations, buildZoneClusters } from "../../shared/decision";
-import type { CrisisReport, NasaSignal } from "../../shared/crisis";
-import { conflictScore, decide, fuseConfidence, nasaConfidence, reportConfidence } from "../../shared/fusion";
+import type { AIAnalysis, CrisisReport, NasaSignal } from "../../shared/crisis";
+import { computeFusedConfidence, conflictScore, decide, nasaConfidence, reportConfidence } from "../../shared/fusion";
+import { buildAuditEntry } from "../../shared/audit-trail";
 import {
   fetchFirmsHotspots,
   fetchGDACSFeed,
@@ -15,6 +16,7 @@ import {
   generateSyntheticReports,
   generateVerifiedCorrection
 } from "./data-flow";
+import { analyzeReport, analyzeReportText } from "./gemini";
 
 initializeApp();
 
@@ -66,8 +68,37 @@ function normalizeReport(id: string, raw: StoredReport): CrisisReport {
       tone: triage.tone === "emotional" || triage.tone === "exaggerated" ? triage.tone : "factual"
     },
     contradictionSignals: Number.isFinite(conflicts) ? conflicts : 0,
-    claim: raw.claim === "negative" ? "negative" : "positive"
+    claim: raw.claim === "negative" || raw.claim === "neutral" ? raw.claim : "positive",
+    ai: raw.ai as AIAnalysis | undefined
   };
+}
+
+function mapAiTypeToCrisisType(type: AIAnalysis["type"]): CrisisReport["geminiOutput"]["type"] {
+  if (type === "earthquake") {
+    return "infrastructure";
+  }
+
+  if (type === "fire") {
+    return "infrastructure";
+  }
+
+  if (type === "flood") {
+    return "flood";
+  }
+
+  return "flood";
+}
+
+function mapAiNeeds(type: AIAnalysis["type"]): CrisisReport["geminiOutput"]["needs"] {
+  if (type === "earthquake") {
+    return ["medical", "rescue"];
+  }
+
+  if (type === "fire") {
+    return ["rescue", "shelter"];
+  }
+
+  return ["rescue"];
 }
 
 async function getAllReports(): Promise<CrisisReport[]> {
@@ -180,7 +211,11 @@ async function writeDerivedState(reports: CrisisReport[], signals: NasaSignal[])
       const crowdScore = reportConfidence(zone.reports, now.getTime());
       const nasaScore = nasaConfidence(zoneSignals, now.getTime());
       const conflict = conflictScore(zone.reports);
-      const finalConfidence = fuseConfidence(crowdScore, nasaScore, conflict, zoneSignals.length > 0);
+      const fusion = computeFusedConfidence(crowdScore, nasaScore, conflict, {
+        scenarioType: zone.reports[0]?.geminiOutput.type === "flood" ? "flood" : zone.reports[0]?.geminiOutput.type === "infrastructure" ? "earthquake" : "mixed",
+        weatherSignal: 0
+      });
+      const finalConfidence = fusion.finalConfidence;
       const decision = decide(finalConfidence);
 
       return {
@@ -189,6 +224,7 @@ async function writeDerivedState(reports: CrisisReport[], signals: NasaSignal[])
         crowdScore,
         nasaScore,
         conflict,
+        fusion,
         finalConfidence,
         decision
       };
@@ -207,7 +243,7 @@ async function writeDerivedState(reports: CrisisReport[], signals: NasaSignal[])
         action,
         zone: item.zone.zone,
         confidence: Number(item.finalConfidence.toFixed(2)),
-        rationale: `reports ${item.crowdScore.toFixed(2)} | nasa ${item.nasaScore.toFixed(2)} | conflict ${item.conflict.toFixed(2)}`
+        rationale: `reports ${item.crowdScore.toFixed(2)} | nasa ${item.nasaScore.toFixed(2)} | conflict ${item.conflict.toFixed(2)}${item.fusion.correlationAdjustments.length ? ` | ${item.fusion.correlationAdjustments[0]}` : ""}`
       };
     });
 
@@ -218,7 +254,11 @@ async function writeDerivedState(reports: CrisisReport[], signals: NasaSignal[])
     const crowdScore = reportConfidence(zone.reports, now.getTime());
     const nasaScore = nasaConfidence(zoneSignals, now.getTime());
     const conflict = conflictScore(zone.reports);
-    const finalConfidence = fuseConfidence(crowdScore, nasaScore, conflict, zoneSignals.length > 0);
+    const fusion = computeFusedConfidence(crowdScore, nasaScore, conflict, {
+      scenarioType: zone.reports[0]?.geminiOutput.type === "flood" ? "flood" : zone.reports[0]?.geminiOutput.type === "infrastructure" ? "earthquake" : "mixed",
+      weatherSignal: 0
+    });
+    const finalConfidence = fusion.finalConfidence;
     const decision = decide(finalConfidence);
     const zoneRef = zonesCollection.doc(zone.zone);
     batch.set(zoneRef, {
@@ -229,9 +269,11 @@ async function writeDerivedState(reports: CrisisReport[], signals: NasaSignal[])
       urgencyScore: Number(zone.urgencyScore.toFixed(3)),
       finalConfidence: Number(finalConfidence.toFixed(3)),
       conflictScore: Number(conflict.toFixed(3)),
+      conflictPenalty: Number(fusion.conflictPenalty.toFixed(3)),
       reportConfidence: Number(crowdScore.toFixed(3)),
       nasaConfidence: Number(nasaScore.toFixed(3)),
       nasaConfirmed: zoneSignals.length > 0,
+      correlationAdjustments: fusion.correlationAdjustments,
       decision,
       needs: zone.dominantNeeds,
       conflictLevel: conflict > 0.66 ? "HIGH" : conflict > 0.33 ? "MEDIUM" : "LOW",
@@ -255,6 +297,22 @@ async function writeDerivedState(reports: CrisisReport[], signals: NasaSignal[])
   });
 
   await batch.commit();
+
+  await Promise.all(
+    recommendations.slice(0, 3).map((recommendation) =>
+      db.collection("audit").add(
+        buildAuditEntry({
+          sessionId: "local-demo",
+          zoneId: recommendation.zone,
+          eventType: "RECOMMENDATION_ISSUED",
+          systemRecommendation: recommendation.action,
+          systemConfidence: recommendation.confidence,
+          systemReasoning: recommendation.rationale,
+          operatorId: "demo-operator"
+        })
+      )
+    )
+  );
 }
 
 async function appendEvent(input: {
@@ -378,6 +436,8 @@ export const fetchWeatherSignals = onRequest(async (_request, response) => {
   }
 });
 
+export { analyzeReport };
+
 export const syncWeatherSignalsEveryFiveMinutes = onSchedule("every 5 minutes", async () => {
   try {
     const signals = await syncWeatherSignals();
@@ -490,6 +550,46 @@ export const onReportWrite = onDocumentWritten("reports/{reportId}", async (even
   const before = event.data?.before.exists ? (event.data.before.data() as StoredReport) : null;
   const after = event.data?.after.exists ? (event.data.after.data() as StoredReport) : null;
   const reportId = event.params.reportId;
+
+  if (after && !after.ai && typeof after.text === "string" && after.text.trim()) {
+    try {
+      const ai = await analyzeReportText(after.text);
+      const triage = {
+        type: mapAiTypeToCrisisType(ai.type),
+        urgency: ai.severity,
+        needs: mapAiNeeds(ai.type),
+        tone: "factual" as const,
+        location: String(after.zone ?? after.zoneId ?? "Unassigned Zone")
+      };
+
+      await db.collection("reports").doc(reportId).set(
+        {
+          ai,
+          claim: ai.claim,
+          triage
+        },
+        { merge: true }
+      );
+
+      await appendEvent({
+        type: "AI_ANALYSIS_COMPLETE",
+        entity: `report:${reportId}`,
+        title: "AI structured output ready",
+        detail: `${ai.type} | confidence ${ai.confidence.toFixed(2)} | claim ${ai.claim}`,
+        level: "resolve"
+      });
+    } catch (error) {
+      await appendEvent({
+        type: "AI_ANALYSIS_FAILED",
+        entity: `report:${reportId}`,
+        title: "AI analysis failed",
+        detail: error instanceof Error ? error.message.slice(0, 280) : "Unknown Gemini analysis error",
+        level: "alert"
+      });
+    }
+
+    return;
+  }
 
   if (after) {
     await appendEvent({

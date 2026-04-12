@@ -95,6 +95,79 @@ export function computeWeights(hasNasa: boolean) {
   return { alpha: 0.7, beta: 0, gamma: 0.6 };
 }
 
+export type EnvironmentalContext = {
+  rainfallIntensity?: number;
+  weatherSignal?: number;
+  scenarioType?: "flood" | "fire" | "earthquake" | "mixed";
+  activeAlerts?: string[];
+};
+
+export type FusionResult = {
+  finalConfidence: number;
+  conflictPenalty: number;
+  weights: {
+    report: number;
+    nasa: number;
+    weather: number;
+  };
+  correlationAdjustments: string[];
+};
+
+export function computeFusedConfidence(
+  reportScore: number,
+  nasaScore: number,
+  conflict: number,
+  context: EnvironmentalContext = {}
+): FusionResult {
+  let weights = {
+    report: 0.5,
+    nasa: nasaScore > 0 ? 0.3 : 0,
+    weather: (context.weatherSignal ?? 0) > 0 ? 0.2 : 0
+  };
+  const correlationAdjustments: string[] = [];
+  const scenarioType = context.scenarioType ?? "mixed";
+  const rainfallIntensity = context.rainfallIntensity ?? context.weatherSignal ?? 0;
+
+  if (scenarioType === "flood" && rainfallIntensity > 0.6) {
+    weights.report *= 0.8;
+    weights.nasa *= 0.75;
+    weights.weather *= 1.2;
+    correlationAdjustments.push("Rainfall correlation penalty applied to crowd and satellite signals.");
+  }
+
+  if (scenarioType === "fire" && nasaScore > 0.7) {
+    weights.nasa *= 1.3;
+    weights.report *= 0.85;
+    correlationAdjustments.push("Fire scenario boosts thermal satellite weighting.");
+  }
+
+  if (scenarioType === "earthquake") {
+    weights.nasa *= 0.5;
+    weights.report *= 1.2;
+    correlationAdjustments.push("Earthquake scenario prioritizes crowd signals over satellite input.");
+  }
+
+  const totalWeight = Math.max(EPS, weights.report + weights.nasa + weights.weather);
+  weights = {
+    report: weights.report / totalWeight,
+    nasa: weights.nasa / totalWeight,
+    weather: weights.weather / totalWeight
+  };
+
+  const rawFused =
+    weights.report * reportScore +
+    weights.nasa * nasaScore +
+    weights.weather * (context.weatherSignal ?? rainfallIntensity ?? 0);
+  const conflictPenalty = conflict * 0.6;
+
+  return {
+    finalConfidence: clamp(rawFused - conflictPenalty),
+    conflictPenalty,
+    weights,
+    correlationAdjustments
+  };
+}
+
 export function fuseConfidence(reportScore: number, nasaScore: number, conflict: number, hasNasa: boolean): number {
   const { alpha, beta, gamma } = computeWeights(hasNasa);
   return clamp(alpha * reportScore + beta * nasaScore - gamma * conflict);

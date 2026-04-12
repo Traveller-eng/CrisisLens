@@ -1,5 +1,5 @@
 import type { DocumentData, QueryDocumentSnapshot, Timestamp } from "firebase/firestore";
-import type { CrisisReport, CrisisType, NeedType, SourceType, ToneType } from "../../../shared/crisis";
+import type { AIAnalysis, ClaimType, CrisisReport, CrisisType, NeedType, SourceType, ToneType } from "../../../shared/crisis";
 
 const validSourceTypes = new Set<SourceType>(["verified_org", "ngo", "unknown", "anonymous"]);
 const validTypes = new Set<CrisisType>(["flood", "injury", "infrastructure", "shelter"]);
@@ -67,6 +67,11 @@ export function normalizeReport(doc: QueryDocumentSnapshot<DocumentData>): Crisi
       needs: normalizeNeeds(triage.needs),
       tone: normalizeTone(triage.tone)
     },
-    contradictionSignals: Number.isFinite(conflicts) ? conflicts : 0
+    contradictionSignals: Number.isFinite(conflicts) ? conflicts : 0,
+    claim:
+      raw.claim === "negative" || raw.claim === "neutral"
+        ? (raw.claim as ClaimType)
+        : ("positive" as ClaimType),
+    ai: (raw.ai ?? undefined) as AIAnalysis | undefined
   };
 }

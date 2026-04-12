@@ -15,6 +15,8 @@ CrisisLens is an AI-powered decision intelligence system for disaster response u
 - Includes a NASA FIRMS hotspot layer for satellite-backed fire/heat anomaly signals
 - Includes an OpenWeather flood-risk layer with rain, humidity, wind, and pressure signals
 - Includes automated adversarial fusion tests with deterministic generators
+- Includes correlation-aware fusion to reduce double-counting across crowd and satellite signals
+- Includes append-only audit records for recommendation accountability
 
 ## Tech stack
 
@@ -22,7 +24,7 @@ CrisisLens is an AI-powered decision intelligence system for disaster response u
 - Backend: Firebase Functions
 - Data: Firestore
 - Map: Google Maps
-- AI layer: simulated triage structure, Gemini-ready config
+- AI layer: Gemini JSON-mode triage with validation and fallback classification
 
 ## Project structure
 
@@ -243,11 +245,12 @@ The strongest differentiator is the trust engine:
 
 ## Fusion logic
 
-The backend now computes zone confidence from three parts:
+The backend now computes zone confidence from:
 
 1. crowd report confidence
 2. NASA FIRMS confidence
 3. conflict penalty
+4. optional correlation-aware weighting
 
 Conceptually:
 
@@ -258,12 +261,26 @@ Final Confidence =
   gamma * conflictScore
 ```
 
+In V3, the fusion layer also supports correlation-aware weighting. For example, during high-rainfall flood conditions, crowd and satellite weights are both reduced while weather-derived flood risk is boosted to avoid double-counting the same underlying event.
+
 The result drives:
 
 - zone coloring
 - decision authority
 - conflict highlighting
 - truth-vs-noise filtering
+
+## Gemini guarantees
+
+The Gemini triage layer now:
+
+- requests strict JSON only
+- validates every field before trust computation
+- supports reasoning text for UI explainability
+- supports contradiction signal output
+- falls back to keyword classification if Gemini fails
+
+This prevents invalid `unknown` classifications from silently flowing into the trust engine.
 
 ## Reality layer
 
@@ -288,13 +305,31 @@ Use it in the story like this:
 4. trust shifts
 5. decisions reorder
 
-## Killer metric used in the UI
+## Testing and real metric extraction
 
-The demo currently highlights:
+Run:
 
-`False-signal impact reduced by 40%`
+```powershell
+npm test
+```
 
-This is framed as a simulated metric for Chennai flood conditions with contradiction-aware trust scoring and verified correction events.
+The repo now includes:
+
+- `tests/fusion.test.ts`
+- `tests/metrics.test.ts`
+- `tests/metric-extraction.test.ts`
+
+These cover:
+
+- ideal dispatch path
+- misinformation suppression
+- coordinated fake attack resilience
+- conflict explosion
+- sparse-data handling
+- performance under load
+- reproducible false-positive reduction extraction
+
+Use the extracted test result as the real headline metric instead of a simulated percentage.
 
 ## War-room layout
 
@@ -316,6 +351,16 @@ The UI is now organized like an operations center:
   - live event feed
 - Bottom:
   - timeline scrubber
+
+## Accountability model
+
+CrisisLens is a decision-support system, not an autonomous responder.
+
+The backend now supports append-only audit-style entries for recommendation issuance. The intended next layer is:
+
+- system issues recommendation
+- coordinator confirms or overrides
+- operator action and reasoning are retained for later review
 
 ## Useful local backend URLs
 

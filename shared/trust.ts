@@ -67,27 +67,31 @@ export function scoreReport(report: CrisisReport, zoneReports: CrisisReport[], n
   const reasons: string[] = [];
 
   if (sourcePrior >= 0.8) {
-    reasons.push("High-trust source improves credibility");
+    reasons.push(`${report.sourceType === "verified_org" ? "Verified command/agency source" : "NGO source"} lifts baseline credibility to ${sourcePrior.toFixed(2)}.`);
   } else {
-    reasons.push("Low-trust source reduces baseline confidence");
+    reasons.push(`${report.sourceType === "anonymous" ? "Anonymous source" : "Unknown source"} starts with a low prior of ${sourcePrior.toFixed(2)} before corroboration.`);
   }
 
   if (crossSignalAgreement >= 0.66) {
-    reasons.push("Multiple nearby reports agree on the same crisis signal");
+    reasons.push(`${similarReports.length} nearby reports align on the same ${report.geminiOutput.type} signal, pushing cross-agreement to ${crossSignalAgreement.toFixed(2)}.`);
   } else {
-    reasons.push("Weak cross-report agreement lowers confidence");
+    reasons.push(`Only ${similarReports.length} nearby reports support this signal, so cross-agreement remains weak at ${crossSignalAgreement.toFixed(2)}.`);
   }
 
   if (contradictionScore < 0.6) {
-    reasons.push("Contradicting nearby evidence reduces trust");
+    reasons.push(`Contradicting evidence is active in this zone, dragging contradiction health down to ${contradictionScore.toFixed(2)}.`);
   }
 
   if (report.geminiOutput.tone !== "factual") {
-    reasons.push("Non-factual tone reduces reliability");
+    reasons.push(`${report.geminiOutput.tone} tone lowers language reliability to ${languageScore.toFixed(2)}.`);
   }
 
   if (minutesSinceReport > 20) {
-    reasons.push("Report aged out through time decay");
+    reasons.push(`This report is ${minutesSinceReport} minutes old, so time decay has started reducing its weight.`);
+  }
+
+  if (report.ai?.reasoning) {
+    reasons.push(report.ai.reasoning);
   }
 
   const trust: TrustBreakdown = {
@@ -108,4 +112,3 @@ export function scoreReport(report: CrisisReport, zoneReports: CrisisReport[], n
     trust
   };
 }
-

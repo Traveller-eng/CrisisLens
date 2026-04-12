@@ -3,7 +3,19 @@ export type CrisisType = "flood" | "injury" | "infrastructure" | "shelter";
 export type NeedType = "rescue" | "medical" | "food" | "shelter";
 export type ToneType = "factual" | "emotional" | "exaggerated";
 export type TrustState = "VERIFIED" | "UNCERTAIN" | "FALSE";
-export type ClaimType = "positive" | "negative";
+export type ClaimType = "positive" | "negative" | "neutral";
+export type ContradictionSignal = "high" | "low" | "none";
+export type AIAnalysis = {
+  type: "flood" | "fire" | "earthquake" | "infrastructure" | "injury" | "shelter" | "supply" | "unknown";
+  severity: number;
+  confidence: number;
+  claim: ClaimType;
+  entities: string[];
+  urgency?: number;
+  reasoning?: string;
+  contradictionSignal?: ContradictionSignal;
+  isFallback?: boolean;
+};
 
 export type CrisisReport = {
   id: string;
@@ -22,6 +34,7 @@ export type CrisisReport = {
   };
   contradictionSignals?: number;
   claim?: ClaimType;
+  ai?: AIAnalysis;
 };
 
 export type NasaSignal = {
