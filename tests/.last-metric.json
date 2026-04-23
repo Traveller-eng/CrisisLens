@@ -1,0 +1,13 @@
+{
+  "value": 100,
+  "seed": "42-46",
+  "scenarioSet": [
+    "Balanced",
+    "Heavy Misinfo",
+    "Light Misinfo",
+    "Pure Noise",
+    "Coordinated Attack"
+  ],
+  "totalFalseReports": 210,
+  "generatedAt": "2026-04-22T16:02:13.564Z"
+}

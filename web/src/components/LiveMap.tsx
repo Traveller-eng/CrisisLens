@@ -10,14 +10,27 @@ type MapZone = {
   conflictScore?: number;
 };
 
+export type ShelterMarker = {
+  id: string;
+  name: string;
+  address: string;
+  capacity: string;
+  contact: string;
+  lastUpdated: string;
+  lat: number;
+  lng: number;
+};
+
 type LiveMapProps = {
   apiKey: string;
   zones: MapZone[];
+  shelters?: ShelterMarker[];
   nasaHotspots?: Array<{ latitude: number; longitude: number; confidence: string }>;
   weatherSignals?: Array<{ lat: number; lng: number; rain: number; riskScore: number; wind: number; windDeg?: number }>;
   showWeatherLayer?: boolean;
   selectedZoneId: string | null;
   onSelectZone: (zoneId: string) => void;
+  onSelectShelter?: (shelterId: string) => void;
 };
 
 declare global {
@@ -86,15 +99,18 @@ function markerColor(zone: MapZone): string {
 export default function LiveMap({
   apiKey,
   zones,
+  shelters = [],
   nasaHotspots = [],
   weatherSignals = [],
   showWeatherLayer = false,
   selectedZoneId,
-  onSelectZone
+  onSelectZone,
+  onSelectShelter
 }: LiveMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<{ setCenter?: (...args: unknown[]) => void; fitBounds?: (bounds: unknown, padding?: number) => void } | null>(null);
   const markersRef = useRef<Array<{ setMap: (map: unknown) => void }>>([]);
+  const shelterMarkersRef = useRef<Array<{ setMap: (map: unknown) => void }>>([]);
   const nasaMarkersRef = useRef<Array<{ setMap: (map: unknown) => void }>>([]);
   const weatherMarkersRef = useRef<Array<{ setMap: (map: unknown) => void }>>([]);
   const weatherCirclesRef = useRef<Array<{ setMap: (map: unknown) => void }>>([]);
@@ -116,8 +132,9 @@ export default function LiveMap({
         }
 
         if (!mapRef.current) {
+          const fallbackCenter = shelters[0] ? { lat: shelters[0].lat, lng: shelters[0].lng } : { lat: 13.0827, lng: 80.2707 };
           mapRef.current = new window.google.maps.Map(containerRef.current, {
-            center: zones[0]?.center ?? { lat: 13.0827, lng: 80.2707 },
+            center: zones[0]?.center ?? fallbackCenter,
             zoom: 11,
             styles: [
               { elementType: "geometry", stylers: [{ color: "#0b1f2e" }] },
@@ -132,6 +149,7 @@ export default function LiveMap({
         }
 
         markersRef.current.forEach((marker) => marker.setMap(null));
+        shelterMarkersRef.current.forEach((marker) => marker.setMap(null));
         nasaMarkersRef.current.forEach((marker) => marker.setMap(null));
         weatherMarkersRef.current.forEach((marker) => marker.setMap(null));
         weatherCirclesRef.current.forEach((circle) => circle.setMap(null));
@@ -160,6 +178,28 @@ export default function LiveMap({
           });
 
           marker.addListener("click", () => onSelectZone(zone.zoneId));
+          return marker;
+        });
+
+        shelterMarkersRef.current = shelters.map((shelter) => {
+          const marker = new window.google!.maps.Marker({
+            map: mapRef.current!,
+            position: { lat: shelter.lat, lng: shelter.lng },
+            title: shelter.name,
+            icon: {
+              path: window.google!.maps.SymbolPath.CIRCLE,
+              fillColor: "#72d6ff",
+              fillOpacity: 0.92,
+              strokeColor: "#f7fbff",
+              strokeWeight: 1,
+              scale: 8
+            }
+          });
+
+          if (onSelectShelter) {
+            marker.addListener("click", () => onSelectShelter(shelter.id));
+          }
+
           return marker;
         });
 
@@ -246,14 +286,17 @@ export default function LiveMap({
             )
           : [];
 
-        if (zones.length > 1 && mapRef.current?.fitBounds && window.google?.maps?.LatLngBounds) {
+        if ((zones.length > 1 || shelters.length > 1) && mapRef.current?.fitBounds && window.google?.maps?.LatLngBounds) {
           const bounds = new window.google.maps.LatLngBounds();
           zones.forEach((zone) => bounds.extend(zone.center));
+          shelters.forEach((shelter) => bounds.extend({ lat: shelter.lat, lng: shelter.lng }));
           nasaHotspots.forEach((hotspot) => bounds.extend({ lat: hotspot.latitude, lng: hotspot.longitude }));
           weatherSignals.forEach((signal) => bounds.extend({ lat: signal.lat, lng: signal.lng }));
           mapRef.current.fitBounds(bounds, 64);
         } else if (zones.length === 1 && mapRef.current?.setCenter) {
           mapRef.current.setCenter(zones[0].center);
+        } else if (shelters.length === 1 && mapRef.current?.setCenter) {
+          mapRef.current.setCenter({ lat: shelters[0].lat, lng: shelters[0].lng });
         }
 
         if (zones.length > 0 && !selectedZoneId) {
@@ -289,7 +332,9 @@ export default function LiveMap({
           animationFrameRef.current = window.requestAnimationFrame(animate);
         };
 
-        animationFrameRef.current = window.requestAnimationFrame(animate);
+        if (zones.length > 0) {
+          animationFrameRef.current = window.requestAnimationFrame(animate);
+        }
       })
       .catch(() => undefined);
 
@@ -299,7 +344,7 @@ export default function LiveMap({
         window.cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [apiKey, nasaHotspots, onSelectZone, selectedZoneId, showWeatherLayer, weatherSignals, zones]);
+  }, [apiKey, nasaHotspots, onSelectShelter, onSelectZone, selectedZoneId, shelters, showWeatherLayer, weatherSignals, zones]);
 
   return <div className="real-map" ref={containerRef} />;
 }

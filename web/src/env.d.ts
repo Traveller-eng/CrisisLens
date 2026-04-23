@@ -12,6 +12,7 @@ interface ImportMetaEnv {
   readonly VITE_USE_FIREBASE_EMULATORS: string;
   readonly VITE_FIRESTORE_EMULATOR_HOST: string;
   readonly VITE_FIRESTORE_EMULATOR_PORT: string;
+  readonly VITE_GOOGLE_CHAT_WEBHOOK_URL?: string;
 }
 
 interface ImportMeta {

@@ -4,16 +4,22 @@ import { httpsCallable } from "firebase/functions";
 import { buildRecommendations, buildZoneClusters } from "../../shared/decision";
 import { demoReports, demoResources } from "../../shared/demo-data";
 import type { AIAnalysis, CrisisReport, Recommendation, ScoredReport, ZoneCluster } from "../../shared/crisis";
-import { clamp, decide, fuseConfidence } from "../../shared/fusion";
+import { clamp, computeFusedConfidence, conflictScore as computeConflictScore, decide } from "../../shared/fusion";
+import type { ZoneConfidenceBreakdown } from "../../shared/zone-update";
+import { buildAuditEntry, buildSessionId, validateOperatorAction } from "../../shared/audit-trail";
 import { appConfig, setupChecklist } from "./config";
 import { db, firebaseEnabled, functionsClient } from "./lib/firebase";
 import { normalizeReport } from "./lib/live-reports";
 import AIPanel from "./components/AIPanel";
+import { analyzeReportDirect, geminiDirectAvailable, getPrecomputedAi } from "./lib/gemini-direct";
+import { triggerGoogleChatAlert } from "./lib/chatWebhook";
 
 const LiveMap = lazy(() => import("./components/LiveMap"));
 
 const simulationStart = new Date("2026-04-09T08:00:00.000Z");
 const simulationDurationSeconds = 180;
+const MAX_AI_CONCURRENCY = 2;
+const AI_QUEUE_INTERVAL_MS = 2200;
 
 type FeedEvent = {
   id: string;
@@ -22,6 +28,8 @@ type FeedEvent = {
   detail: string;
   tone: "info" | "alert" | "resolve";
 };
+
+type AiStage = "raw" | "queued" | "processing" | "refined" | "fallback";
 
 type DerivedZone = {
   zoneId: string;
@@ -38,6 +46,7 @@ type DerivedZone = {
   needs: string[];
   conflictLevel: string;
   affectedEstimate: number;
+  breakdown: ZoneConfidenceBreakdown;
 };
 
 type NasaHotspot = {
@@ -127,6 +136,38 @@ function formatClock(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return `T+${minutes.toString().padStart(2, "0")}:${remainingSeconds.toString().padStart(2, "0")}`;
+}
+
+function getFunctionUrl(name: string): string {
+  if (appConfig.emulators.enabled) {
+    return `http://${appConfig.emulators.firestoreHost}:5005/${appConfig.firebase.projectId}/us-central1/${name}`;
+  }
+
+  return `https://us-central1-${appConfig.firebase.projectId}.cloudfunctions.net/${name}`;
+}
+
+async function fetchFunctionJson<T>(name: string): Promise<T> {
+  const response = await fetch(getFunctionUrl(name));
+  const text = await response.text();
+  let payload: unknown = null;
+
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = text;
+  }
+
+  if (!response.ok) {
+    const detail =
+      typeof payload === "string"
+        ? payload
+        : typeof payload === "object" && payload && "error" in payload
+          ? String((payload as { error?: unknown }).error)
+          : `HTTP ${response.status}`;
+    throw new Error(`${name} failed: ${detail}`);
+  }
+
+  return payload as T;
 }
 
 function toSimulationSecond(timestamp: string): number {
@@ -235,40 +276,32 @@ function mergeAiAnalysis(report: CrisisReport, ai: AIAnalysis): CrisisReport {
   };
 }
 
-function reportDedupKey(report: CrisisReport): string {
-  return `${report.zone}|${report.sourceType}|${report.text.trim().toLowerCase().replace(/\s+/g, " ")}`;
+function buildFallbackAnalysis(report: CrisisReport): AIAnalysis {
+  return {
+    type: report.geminiOutput.type === "injury" ? "injury" : report.geminiOutput.type === "shelter" ? "shelter" : report.geminiOutput.type,
+    severity: report.geminiOutput.urgency,
+    confidence: 0.35,
+    claim: report.claim ?? "positive",
+    entities: [report.zone],
+    urgency: report.geminiOutput.urgency,
+    reasoning: "Heuristic fallback kept the report in flow because Gemini did not respond in time.",
+    contradictionSignal: report.contradictionSignals ? "high" : "none",
+    isFallback: true
+  };
 }
 
 function dedupeReports(existing: CrisisReport[], incoming: CrisisReport[]): CrisisReport[] {
-  const seen = new Map<string, number>();
+  const seenKeyToReport = new Map<string, CrisisReport>();
 
   [...existing, ...incoming].forEach((report) => {
-    const key = reportDedupKey(report);
-    const time = new Date(report.timestamp).getTime();
-    const previous = seen.get(key);
-    if (previous === undefined || Math.abs(time - previous) > 30000) {
-      seen.set(key, time);
+    const timeBucket = Math.floor(new Date(report.timestamp).getTime() / 30000);
+    const key = `${report.zone}|${report.sourceType}|${report.text.trim().toLowerCase().replace(/\s+/g, " ")}|${timeBucket}`;
+    if (!seenKeyToReport.has(key)) {
+      seenKeyToReport.set(key, report);
     }
   });
 
-  const accepted: CrisisReport[] = [];
-  const acceptedTimes = new Map<string, number>();
-
-  [...existing, ...incoming]
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-    .forEach((report) => {
-      const key = reportDedupKey(report);
-      const time = new Date(report.timestamp).getTime();
-      const previous = acceptedTimes.get(key);
-      if (previous !== undefined && Math.abs(time - previous) <= 30000) {
-        return;
-      }
-
-      acceptedTimes.set(key, time);
-      accepted.push(report);
-    });
-
-  return accepted;
+  return Array.from(seenKeyToReport.values());
 }
 
 function simulationProfile(index: number, scenario: ScenarioKey): SimulationProfile | null {
@@ -276,48 +309,74 @@ function simulationProfile(index: number, scenario: ScenarioKey): SimulationProf
     return null;
   }
 
-  const phase = index % 12;
+  const step = index % 18;
 
-  if (phase <= 3) {
+  // Phase A (steps 0-5): Zone A — high-trust flood reports → DISPATCH
+  if (step <= 5) {
+    const texts = [
+      "Water rising fast near riverbank homes in Zone A",
+      "Floodwater entering streets near shelters, multiple families affected",
+      "Rescue support needed for stranded families near Zone A bridge",
+      "Verified NDRF update: rescue boats deployed in Zone A sector",
+      "NGO field team confirms widespread flooding and evacuation need",
+      "Verified command: Zone A flood confirmed, rescue operations underway"
+    ];
     return {
       zone: "Zone A",
-      sourceType: phase === 3 ? "verified_org" : "ngo",
+      sourceType: step >= 3 ? "verified_org" : "ngo",
       type: "flood" as const,
       tone: "factual" as const,
-      urgency: 0.74 + phase * 0.05,
-      text: ["Water rising fast near homes", "Floodwater entering streets near shelters", "Rescue support needed for stranded families", "Verified NGO update: rescue boats needed in Zone A"][phase],
+      urgency: 0.78 + step * 0.03,
+      text: texts[step],
       contradictionSignals: 0,
       claim: "positive" as const,
       baseCoords: { lat: 13.0827, lng: 80.2707 }
     };
   }
 
-  if (phase <= 8) {
-    const slot = phase - 4;
+  // Phase B (steps 6-11): Zone B — mixed signals, contradiction → VERIFY / PARTIAL RESPONSE
+  if (step <= 11) {
+    const slot = step - 6;
+    const texts = [
+      "Airport flooded, hundreds stranded on approach roads",
+      "Bridge collapsed near airport, total access lost",
+      "Local volunteer reports partial flooding near terminal",
+      "People trapped near airport approach, conflicting details",
+      "NGO liaison: airport operational with minor waterlogging only",
+      "Verified correction: airport operational, no full flooding observed"
+    ];
     return {
       zone: "Zone B",
-      sourceType: slot === 4 ? "verified_org" : "anonymous",
+      sourceType: slot >= 4 ? (slot === 5 ? "verified_org" : "ngo") : "anonymous",
       type: "infrastructure" as const,
-      tone: slot >= 2 ? "exaggerated" as const : "emotional" as const,
-      urgency: 0.48 + slot * 0.08,
-      text:
-        ["Airport flooded, 400 stranded", "Bridge collapsed, total access lost", "People trapped near airport approach", "Runway underwater and unusable", "Verified correction: airport operational, no flooding observed"][slot],
-      contradictionSignals: slot === 4 ? 0 : 2,
-      claim: slot === 4 ? ("negative" as const) : ("negative" as const),
+      tone: slot >= 4 ? ("factual" as const) : slot >= 2 ? ("exaggerated" as const) : ("emotional" as const),
+      urgency: slot >= 4 ? 0.35 : 0.58 + slot * 0.06,
+      text: texts[slot],
+      contradictionSignals: slot >= 4 ? 0 : 2,
+      claim: slot >= 4 ? ("positive" as const) : ("negative" as const),
       baseCoords: { lat: 13.1986, lng: 80.1692 }
     };
   }
 
-  const slot = phase - 9;
+  // Phase C (steps 12-17): Zone C — misinformation burst → DO NOT DISPATCH
+  const slot = step - 12;
+  const texts = [
+    "BREAKING: dam burst imminent, Zone C will be completely submerged",
+    "Unconfirmed surge report spreading on social media for Zone C",
+    "Anonymous tip: massive chemical leak in Zone C floodwater",
+    "Rumor mill: Zone C shelters destroyed, hundreds missing",
+    "Panic reports: Zone C roads and bridges all collapsed",
+    "Social media frenzy: Zone C declared total disaster zone by unknown source"
+  ];
   return {
     zone: "Zone C",
-    sourceType: slot === 2 ? "ngo" : "anonymous",
-    type: slot === 2 ? ("shelter" as const) : ("flood" as const),
-    tone: slot === 2 ? ("factual" as const) : ("emotional" as const),
-    urgency: slot === 2 ? 0.54 : 0.38 + slot * 0.05,
-    text: ["Rumor: dam burst approaching Zone C", "Unconfirmed surge report spreading online", "NGO field note: minor waterlogging only, no evacuation yet"][slot],
-    contradictionSignals: slot === 2 ? 0 : 2,
-    claim: slot === 2 ? ("positive" as const) : ("negative" as const),
+    sourceType: "anonymous",
+    type: "flood" as const,
+    tone: "exaggerated" as const,
+    urgency: 0.92 - slot * 0.02,
+    text: texts[slot],
+    contradictionSignals: 3,
+    claim: "negative" as const,
     baseCoords: { lat: 13.056, lng: 80.245 }
   };
 }
@@ -327,8 +386,25 @@ function buildConfidenceStory(zone: DerivedZone | null, report: ScoredReport | n
     return "Confidence breakdown appears when a zone and report are selected.";
   }
 
-  const conflictDrag = Math.max(0, report.trust.decayedTrust + zone.nasaConfidence - zone.finalConfidence);
-  return `Trust input ${report.trust.decayedTrust.toFixed(2)}${zone.nasaConfirmed ? ` + NASA ${zone.nasaConfidence.toFixed(2)}` : " + NASA 0.00"} - conflict drag ${conflictDrag.toFixed(2)} = final ${zone.finalConfidence.toFixed(2)}.`;
+  const bd = zone.breakdown;
+  const trustContrib = (report.trust.decayedTrust * bd.reportWeight);
+  const nasaContrib = (zone.nasaConfidence * bd.nasaWeight);
+  const penalty = bd.conflictPenalty;
+  const parts: string[] = [];
+  parts.push(`Trust input ${report.trust.decayedTrust.toFixed(2)} weighted at ${(bd.reportWeight * 100).toFixed(0)}% contributed ${trustContrib.toFixed(2)}`);
+  if (bd.nasaActive) {
+    parts.push(`satellite overlay added ${nasaContrib.toFixed(2)}`);
+  } else {
+    parts.push("no satellite layer active");
+  }
+  if (penalty > 0.01) {
+    parts.push(`conflict penalty (${bd.conflictCount} signals) subtracted ${penalty.toFixed(2)}`);
+  }
+  if (bd.correlationAdjustments.length > 0) {
+    parts.push(bd.correlationAdjustments[0]);
+  }
+  parts.push(`yielding final confidence ${zone.finalConfidence.toFixed(2)}`);
+  return parts.join(", ") + ".";
 }
 
 function useSimulationClock() {
@@ -543,6 +619,21 @@ export default function App() {
   const pipelineTimersRef = useRef<number[]>([]);
   const previousRecommendationRef = useRef<string>("");
   const analysisInFlightRef = useRef<Set<string>>(new Set());
+  const [auditSessionId] = useState(() => buildSessionId());
+  const [overrideTarget, setOverrideTarget] = useState<string | null>(null);
+  const [overrideReason, setOverrideReason] = useState("");
+  const [benchmarkedMetric, setBenchmarkedMetric] = useState<{ value: number; scenarioSet: string[]; generatedAt: string } | null>(null);
+  const [aiLifecycle, setAiLifecycle] = useState<Record<string, AiStage>>({});
+
+  useEffect(() => {
+    fetchFunctionJson<{ value: number; scenarioSet: string[]; generatedAt: string }>("fetchSuppressionMetric")
+      .then(data => {
+        if (data.value !== undefined) {
+          setBenchmarkedMetric(data);
+        }
+      })
+      .catch((err) => console.log("Metric fetch skipped/failed:", err.message));
+  }, []);
 
   useEffect(() => {
     if (!firebaseEnabled || !db) {
@@ -600,6 +691,7 @@ export default function App() {
     const unsubscribeZones = onSnapshot(collection(db, "zones"), (snapshot) => {
       const nextZones = snapshot.docs.map((zoneDoc) => {
         const raw = zoneDoc.data() as Record<string, unknown>;
+        const rawBreakdown = (raw.breakdown ?? {}) as Record<string, unknown>;
         return {
           zoneId: zoneDoc.id,
           center: {
@@ -620,7 +712,16 @@ export default function App() {
               : "HOLD",
           needs: Array.isArray(raw.needs) ? (raw.needs as string[]) : [],
           conflictLevel: String(raw.conflictLevel ?? "LOW"),
-          affectedEstimate: Number(raw.affectedEstimate ?? 0)
+          affectedEstimate: Number(raw.affectedEstimate ?? 0),
+          breakdown: {
+            reportWeight: Number(rawBreakdown.reportWeight ?? 0.5),
+            nasaWeight: Number(rawBreakdown.nasaWeight ?? 0),
+            weatherWeight: Number(rawBreakdown.weatherWeight ?? 0),
+            conflictPenalty: Number(rawBreakdown.conflictPenalty ?? 0),
+            correlationAdjustments: Array.isArray(rawBreakdown.correlationAdjustments) ? (rawBreakdown.correlationAdjustments as string[]) : [],
+            conflictCount: Number(rawBreakdown.conflictCount ?? 0),
+            nasaActive: Boolean(rawBreakdown.nasaActive)
+          }
         } satisfies DerivedZone;
       });
 
@@ -659,32 +760,42 @@ export default function App() {
   const mapZones =
     usingLiveReports && liveZones.length
       ? liveZones
-      : zones.map((zone) => ({
-          zoneId: zone.zone,
-          center: { lat: zone.lat, lng: zone.lng },
-          reports: zone.reports.map((report) => report.id),
-          trustScore: zone.trustScore,
-          urgencyScore: zone.urgencyScore,
-          finalConfidence: 0,
-          conflictScore: Math.min(1, zone.reports.filter((report) => report.contradictionSignals && report.contradictionSignals > 0).length / Math.max(1, zone.reports.length)),
-          reportConfidence: zone.trustScore,
-          nasaConfidence: showNasaLayer ? 0.62 : 0,
-          nasaConfirmed: showNasaLayer,
-          decision: "HOLD" as const,
-          needs: zone.dominantNeeds,
-          conflictLevel: zone.trustScore < 0.45 ? "HIGH" : zone.trustScore < 0.75 ? "MEDIUM" : "LOW",
-          affectedEstimate: zone.affectedEstimate
-        }))
-      .map((zone) => {
-        const finalConfidence = fuseConfidence(zone.reportConfidence, zone.nasaConfidence, zone.conflictScore, zone.nasaConfirmed);
-        const decision = zone.conflictScore > 0.6 && finalConfidence < 0.55 ? "HOLD" : decide(finalConfidence);
-        return {
-          ...zone,
-          finalConfidence,
-          decision,
-          conflictLevel: zone.conflictScore > 0.6 ? "HIGH" : zone.conflictScore > 0.3 ? "MEDIUM" : "LOW"
-        };
-      });
+      : zones.map((zone) => {
+          const conflict = computeConflictScore(zone.reports);
+          const nasaScore = showNasaLayer ? 0.62 : 0;
+          const fusion = computeFusedConfidence(zone.trustScore, nasaScore, conflict, {
+            scenarioType: zone.reports[0]?.geminiOutput.type === "flood" ? "flood" : zone.reports[0]?.geminiOutput.type === "infrastructure" ? "earthquake" : "mixed",
+            weatherSignal: 0
+          });
+          const finalConfidence = fusion.finalConfidence;
+          const decision = conflict > 0.6 && finalConfidence < 0.55 ? "HOLD" : decide(finalConfidence);
+          const conflictingReports = zone.reports.filter((report) => (report.contradictionSignals ?? 0) > 0 || report.claim === "negative");
+          return {
+            zoneId: zone.zone,
+            center: { lat: zone.lat, lng: zone.lng },
+            reports: zone.reports.map((report) => report.id),
+            trustScore: zone.trustScore,
+            urgencyScore: zone.urgencyScore,
+            finalConfidence,
+            conflictScore: conflict,
+            reportConfidence: zone.trustScore,
+            nasaConfidence: nasaScore,
+            nasaConfirmed: showNasaLayer,
+            decision,
+            needs: zone.dominantNeeds,
+            conflictLevel: conflict > 0.6 ? "HIGH" : conflict > 0.3 ? "MEDIUM" : "LOW",
+            affectedEstimate: zone.affectedEstimate,
+            breakdown: {
+              reportWeight: fusion.weights.report,
+              nasaWeight: fusion.weights.nasa,
+              weatherWeight: fusion.weights.weather,
+              conflictPenalty: fusion.conflictPenalty,
+              correlationAdjustments: fusion.correlationAdjustments,
+              conflictCount: conflictingReports.length,
+              nasaActive: nasaScore > 0
+            }
+          } satisfies DerivedZone;
+        });
   const visibleMapZones =
     truthMode === "filtered"
       ? mapZones.filter((zone) => zone.finalConfidence >= 0.45 || zone.conflictLevel === "HIGH" || zone.nasaConfirmed)
@@ -714,17 +825,50 @@ export default function App() {
     null;
 
   const incomingFeed = useMemo(
-    () =>
-      [...allReports]
-        .filter((report) => (truthMode === "raw" ? true : report.trust.decayedTrust >= 0.45))
-        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-        .slice(0, 18),
+    () => {
+      const recentReports = [...allReports].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+      if (truthMode === "raw") {
+        return recentReports.slice(0, 18);
+      }
+
+      const highSignal = recentReports.filter(
+        (report) =>
+          report.trust.decayedTrust >= 0.45 ||
+          report.sourceType === "verified_org" ||
+          report.sourceType === "citizen" ||
+          (report.contradictionSignals ?? 0) >= 2
+      );
+
+      if (highSignal.length >= 10) {
+        return highSignal.slice(0, 18);
+      }
+
+      const highSignalIds = new Set(highSignal.map((report) => report.id));
+      const contextReports = recentReports.filter((report) => !highSignalIds.has(report.id)).slice(0, 10 - highSignal.length);
+      return [...highSignal, ...contextReports].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).slice(0, 18);
+    },
     [allReports, truthMode]
   );
   const conflictZones = mapZones.filter((zone) => zone.conflictLevel === "HIGH");
   const highTrustZones = mapZones.filter((zone) => zone.finalConfidence >= 0.75);
   const topTrustScore = selectedDerivedZone?.finalConfidence ?? recommendations[0]?.confidence ?? 0;
   const confidenceStory = buildConfidenceStory(selectedDerivedZone, selectedReport);
+  const suppressedCount = allReports.filter((report) => (report.claim ?? "positive") === "negative" && report.trust.decayedTrust < 0.45).length;
+  const totalNegative = allReports.filter((report) => (report.claim ?? "positive") === "negative").length;
+  const suppressedMetricPct = totalNegative > 0 ? Math.round((suppressedCount / totalNegative) * 100) : 0;
+  const aiQueue = [...simulationReports, ...localReports]
+    .filter((report) => !report.ai && !analysisInFlightRef.current.has(report.id))
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  const pendingAiCount = aiQueue.length;
+  const aiQueuePosition = selectedReport ? aiQueue.findIndex((report) => report.id === selectedReport.id) + 1 : 0;
+  const selectedAiStage: AiStage = selectedReport
+    ? selectedReport.ai?.isFallback
+      ? "fallback"
+      : selectedReport.ai
+        ? "refined"
+        : aiLifecycle[selectedReport.id] ?? "raw"
+    : "raw";
 
   useEffect(() => {
     const signature = recommendations.map((item) => `${item.zone}:${item.action}:${item.confidence.toFixed(2)}`).join("|");
@@ -757,6 +901,7 @@ export default function App() {
     setLocalEvents([]);
     setSimulationReports([]);
     setSimulationIndex(0);
+    setAiLifecycle({});
     setMinute(0);
   }, [scenario]);
 
@@ -767,6 +912,7 @@ export default function App() {
 
     const seededReports = Array.from({ length: 6 }, (_, index) => generateSimulationReport(index + 1, scenario, (index + 1) * 8));
     setSimulationReports(seededReports);
+    markReportsQueued(seededReports);
     setSimulationIndex(seededReports.length);
     const seedEvent: FeedEvent = {
       id: `seed-${scenario}-${Date.now()}`,
@@ -782,8 +928,10 @@ export default function App() {
       return;
     }
 
+    const intervalMs = speed === 5 ? 550 : speed === 2 ? 950 : 1500;
+
     const generator = window.setInterval(() => {
-      const burstCount = speed >= 5 ? 6 : speed >= 2 ? 3 : 2;
+      const burstCount = speed >= 5 ? 2 : 1;
 
       setSimulationIndex((current) => {
         let nextIndex = current;
@@ -795,7 +943,8 @@ export default function App() {
         }
 
         setSimulationReports((existing) => [...existing.slice(-50), ...nextReports]);
-        nextReports.forEach((report, burst) => {
+        markReportsQueued(nextReports);
+        nextReports.forEach((report) => {
           pushLocalEvent({
             id: `sim-${report.id}`,
             label: burstCount > 1 ? "Burst report received" : "Report received",
@@ -806,62 +955,104 @@ export default function App() {
         startPipelineRun(nextReports[nextReports.length - 1]);
         return nextIndex;
       });
-    }, Math.max(180, 700 / speed));
+    }, intervalMs);
 
     return () => window.clearInterval(generator);
-  }, [usingLiveReports, isPlaying, scenario, speed, minute]);
+  }, [usingLiveReports, isPlaying, minute, scenario, speed]);
 
   useEffect(() => {
-    if (usingLiveReports || !analyzeReportCallable) {
+    if (usingLiveReports) {
       return;
     }
+    const worker = window.setInterval(() => {
+      const capacity = MAX_AI_CONCURRENCY - analysisInFlightRef.current.size;
+      if (capacity <= 0) {
+        return;
+      }
 
-    const pendingReport =
-      [...simulationReports, ...localReports].find(
-        (report) => !report.ai && !analysisInFlightRef.current.has(report.id)
-      ) ?? null;
+      const nextReport =
+        [...simulationReports, ...localReports]
+          .filter((report) => !report.ai && !analysisInFlightRef.current.has(report.id))
+          .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())[0] ?? null;
 
-    if (!pendingReport) {
-      return;
-    }
+      if (!nextReport) {
+        return;
+      }
 
-    analysisInFlightRef.current.add(pendingReport.id);
+      analysisInFlightRef.current.add(nextReport.id);
 
-    void analyzeReportCallable({ text: pendingReport.text })
-      .then((result) => {
-        const ai = result.data;
+      const applyAi = (ai: AIAnalysis, source: string) => {
         setSimulationReports((current) =>
-          current.map((report) => (report.id === pendingReport.id ? mergeAiAnalysis(report, ai) : report))
+          current.map((report) => (report.id === nextReport.id ? mergeAiAnalysis(report, ai) : report))
         );
         setLocalReports((current) =>
-          current.map((report) => (report.id === pendingReport.id ? mergeAiAnalysis(report, ai) : report))
+          current.map((report) => (report.id === nextReport.id ? mergeAiAnalysis(report, ai) : report))
         );
+        setAiLifecycle((current) => ({ ...current, [nextReport.id]: ai.isFallback ? "fallback" : "refined" }));
         pushLocalEvent({
-          id: `ai-${pendingReport.id}`,
-          label: "AI analysis complete",
-          detail: `${pendingReport.zone} | ${ai.type} | claim ${ai.claim} | confidence ${ai.confidence.toFixed(2)}`,
+          id: `ai-${nextReport.id}`,
+          label: ai.isFallback ? "AI heuristic complete" : "AI analysis complete",
+          detail: `${nextReport.zone} | ${ai.type} | claim ${ai.claim} | conf ${ai.confidence.toFixed(2)} (${source})`,
           tone: ai.claim === "negative" ? "alert" : "resolve"
         });
-      })
-      .catch(() => {
+        analysisInFlightRef.current.delete(nextReport.id);
+      };
+
+      // ── GATE 1: Pre-computed or cached AI (instant, zero API calls) ──
+      const precomputed = getPrecomputedAi(nextReport.text);
+      if (precomputed) {
+        setAiLifecycle((current) => ({ ...current, [nextReport.id]: "processing" }));
+        // Small delay to make the "processing → complete" transition visible in the UI
+        window.setTimeout(() => applyAi(precomputed, "pre-computed"), 200);
+        return;
+      }
+
+      // ── GATE 2: Real Gemini API call (rate-limited, cached, for citizen reports) ──
+      setAiLifecycle((current) => ({ ...current, [nextReport.id]: "processing" }));
+      if (geminiDirectAvailable) {
         pushLocalEvent({
-          id: `ai-error-${pendingReport.id}`,
-          label: "AI analysis unavailable",
-          detail: `${pendingReport.zone} stayed on heuristic triage because Gemini did not respond`,
-          tone: "alert"
+          id: `ai-start-${nextReport.id}`,
+          label: "Gemini processing",
+          detail: `${nextReport.zone} sent to Gemini for live classification`,
+          tone: "info"
         });
-      })
-      .finally(() => {
-        analysisInFlightRef.current.delete(pendingReport.id);
-      });
+        analyzeReportDirect(nextReport.text)
+          .then((ai) => applyAi(ai, "Gemini live"))
+          .catch((err) => {
+            console.warn("Gemini API failed:", err);
+            const fallback = buildFallbackAnalysis(nextReport);
+            applyAi(fallback, "heuristic");
+          });
+        return;
+      }
+
+      // ── GATE 3: Local heuristic fallback ──
+      const fallback = buildFallbackAnalysis(nextReport);
+      applyAi(fallback, "heuristic");
+    }, 800);
+
+    return () => window.clearInterval(worker);
   }, [localReports, simulationReports, usingLiveReports]);
 
   function pushLocalEvent(event: FeedEvent) {
     setLocalEvents((current) => [event, ...current].slice(0, 16));
   }
 
+  function markReportsQueued(reports: CrisisReport[]) {
+    setAiLifecycle((current) => {
+      const next = { ...current };
+      reports.forEach((report) => {
+        if (!next[report.id] || next[report.id] === "raw") {
+          next[report.id] = "queued";
+        }
+      });
+      return next;
+    });
+  }
+
   function pushLocalReports(reports: CrisisReport[]) {
     setLocalReports((current) => dedupeReports(current, reports));
+    markReportsQueued(reports);
   }
 
   async function toggleNasaLayer() {
@@ -872,8 +1063,7 @@ export default function App() {
 
     setNasaLoading(true);
     try {
-      const response = await fetch("http://127.0.0.1:5005/crisislens-333ea/us-central1/fetchFIRMS");
-      const payload = (await response.json()) as { hotspots?: NasaHotspot[] };
+      const payload = await fetchFunctionJson<{ hotspots?: NasaHotspot[] }>("fetchFIRMS");
       setNasaHotspots(payload.hotspots ?? []);
       setShowNasaLayer(true);
       pushLocalEvent({
@@ -882,11 +1072,11 @@ export default function App() {
         detail: `Satellite hotspot layer loaded with ${payload.hotspots?.length ?? 0} signals`,
         tone: "resolve"
       });
-    } catch {
+    } catch (error) {
       pushLocalEvent({
         id: `nasa-error-${Date.now()}`,
         label: "NASA layer unavailable",
-        detail: "FIRMS hotspot fetch failed from local backend",
+        detail: error instanceof Error ? error.message : "FIRMS hotspot fetch failed from backend",
         tone: "alert"
       });
     } finally {
@@ -897,9 +1087,8 @@ export default function App() {
   async function syncGdacsLayer() {
     setGdacsLoading(true);
     try {
-      const response = await fetch("http://127.0.0.1:5005/crisislens-333ea/us-central1/fetchGDACSSignals");
-      const payload = (await response.json()) as { ok?: boolean; count?: number; error?: string };
-      if (!response.ok || !payload.ok) {
+      const payload = await fetchFunctionJson<{ ok?: boolean; count?: number; error?: string }>("fetchGDACSSignals");
+      if (payload.ok === false) {
         throw new Error(payload.error ?? "GDACS sync failed");
       }
 
@@ -932,9 +1121,8 @@ export default function App() {
 
     setWeatherLoading(true);
     try {
-      const response = await fetch("http://127.0.0.1:5005/crisislens-333ea/us-central1/fetchWeatherSignals");
-      const payload = (await response.json()) as { ok?: boolean; count?: number; error?: string };
-      if (!response.ok || !payload.ok) {
+      const payload = await fetchFunctionJson<{ ok?: boolean; count?: number; error?: string }>("fetchWeatherSignals");
+      if (payload.ok === false) {
         throw new Error(payload.error ?? "Weather sync failed");
       }
 
@@ -1219,6 +1407,62 @@ export default function App() {
     });
   }
 
+  const handleOperatorAction = async (recommendation: Recommendation, actionType: "CONFIRMED" | "OVERRIDDEN", event: React.MouseEvent | React.FormEvent) => {
+    event.stopPropagation();
+    if (event.type === 'submit') event.preventDefault();
+    
+    const validation = validateOperatorAction(actionType, actionType === "OVERRIDDEN" ? overrideReason : undefined);
+    if (!validation.valid) {
+      alert(validation.error);
+      return;
+    }
+
+    const payload = buildAuditEntry({
+      sessionId: auditSessionId,
+      zoneId: recommendation.zone,
+      eventType: actionType === "CONFIRMED" ? "OPERATOR_CONFIRMED" : "OPERATOR_OVERRIDDEN",
+      systemRecommendation: recommendation.action,
+      systemConfidence: recommendation.confidence,
+      systemReasoning: recommendation.rationale,
+      operatorAction: actionType,
+      operatorReason: actionType === "OVERRIDDEN" ? overrideReason : undefined,
+      operatorId: "demo-operator"
+    });
+
+    if (firebaseEnabled && db) {
+      try {
+        await addDoc(collection(db, "audit", auditSessionId, "entries"), payload);
+      } catch (err) {
+        console.error("Failed to write audit log:", err);
+      }
+    }
+
+    setLocalEvents((prev) => [
+      {
+        id: `audit-${Date.now()}`,
+        tone: actionType === "CONFIRMED" ? "resolve" : "alert",
+        label: actionType === "CONFIRMED" ? "OPERATOR CONFIRMATION" : "OPERATOR OVERRIDE",
+        detail: actionType === "CONFIRMED" ? `Dispatch confirmed for ${recommendation.zone}` : `Override on ${recommendation.zone}: ${overrideReason}`,
+        timestamp: new Date().toISOString()
+      },
+      ...prev
+    ]);
+
+    if (actionType === "OVERRIDDEN") {
+      setOverrideTarget(null);
+      setOverrideReason("");
+    }
+
+    // Fire Google Chat webhook for confirmed dispatches
+    if (actionType === "CONFIRMED" && recommendation.confidence >= 0.6) {
+      triggerGoogleChatAlert({
+        location: recommendation.zone,
+        confidence: `${(recommendation.confidence * 100).toFixed(1)}%`,
+        reasoning: recommendation.rationale
+      });
+    }
+  };
+
   return (
     <div className={`ops-shell ${truthShiftActive ? "ops-shell--truth-shift" : ""}`}>
       <header className="topbar">
@@ -1299,7 +1543,8 @@ export default function App() {
         <StatusPill label={weatherLayerOn ? `Weather ${weatherSignals.length}` : "Weather off"} ready={weatherLayerOn} />
         <StatusPill label={`Verified ${highTrustZones.length}`} ready />
         <StatusPill label={`Conflict ${conflictZones.length}`} ready={conflictZones.length === 0} />
-        <StatusPill label={`Suppressed ${activeReports.filter((report) => (report.claim ?? "positive") === "negative").length}`} ready={false} />
+        <StatusPill label={`Suppressed ${suppressedCount}`} ready={false} />
+        <StatusPill label={pendingAiCount > 0 ? `AI Queue ${pendingAiCount}` : "AI Queue clear"} ready={pendingAiCount === 0} />
         <StatusPill label={`Trust ${topTrustScore.toFixed(2)}`} ready={topTrustScore >= 0.75} />
         <StatusPill label="Gemini" ready={setupChecklist.hasGeminiKey} />
         <StatusPill label="Maps" ready={setupChecklist.hasMapsKey} />
@@ -1417,8 +1662,8 @@ export default function App() {
         </div>
         <div className="metric-banner">
           <span className="mission-label">Killer Metric</span>
-          <strong>False-signal suppression measured in adversarial tests</strong>
-          <p>Run the fusion suite to cite the exact percentage from real suppression scenarios instead of a made-up demo number.</p>
+          <strong>{benchmarkedMetric ? `${benchmarkedMetric.value}% false-dispatch suppression` : (suppressedCount > 0 ? `${suppressedCount} false signals blocked — ${suppressedMetricPct}% suppression rate (local)` : "Awaiting adversarial signals to measure suppression")}</strong>
+          <p>{benchmarkedMetric ? `Benchmarked across ${benchmarkedMetric.scenarioSet.length} scenarios. Generated at ${new Date(benchmarkedMetric.generatedAt).toLocaleTimeString()}.` : (suppressedCount > 0 ? `Of ${totalNegative} negative-claim reports, ${suppressedCount} were suppressed by the trust filter (trust < 0.45). Run \`npm run extract-metric\` for reproducible seed-based extraction.` : "Inject misinformation or start the simulation to see live suppression metrics from the trust engine.")}</p>
         </div>
       </section>
 
@@ -1428,28 +1673,46 @@ export default function App() {
             <h2>Incoming Intelligence</h2>
             <span className="panel-subtitle">Live reports entering the crisis loop before trust filtering</span>
           </div>
-          <div className="intel-stream">
-            {incomingFeed.map((report) => (
-              <button
-                key={report.id}
-                className={`intel-card ${selectedReport?.id === report.id ? "intel-card--active" : ""}`}
-                onClick={() => {
-                  setSelectedReportId(report.id);
-                  setSelectedZoneId(report.zone);
-                }}
-                type="button"
-              >
-                <div className="intel-card__top">
-                  <span>{report.zone}</span>
-                  <span className={`source-chip source-chip--${report.sourceType}`}>{report.sourceType}</span>
-                </div>
-                <strong>{report.text}</strong>
-                <div className="intel-card__bottom">
-                  <span>{report.geminiOutput.type}</span>
-                  <span>{new Date(report.timestamp).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}</span>
-                </div>
-              </button>
-            ))}
+          <div className="intel-table-wrap">
+            <table className="intel-table">
+              <thead>
+                <tr>
+                  <th>Zone</th>
+                  <th>Source</th>
+                  <th>Report</th>
+                  <th>Type</th>
+                  <th>AI</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {incomingFeed.map((report) => (
+                  <tr
+                    key={report.id}
+                    className={`intel-table__row ${selectedReport?.id === report.id ? "intel-table__row--active" : ""}`}
+                    onClick={() => {
+                      setSelectedReportId(report.id);
+                      setSelectedZoneId(report.zone);
+                    }}
+                  >
+                    <td className="intel-table__zone">{report.zone}</td>
+                    <td><span className={`source-chip source-chip--${report.sourceType}`}>{report.sourceType}</span></td>
+                    <td className="intel-table__text">{report.text}</td>
+                    <td>{report.geminiOutput.type}</td>
+                    <td className="intel-table__ai">
+                      {report.ai?.isFallback
+                        ? "fallback"
+                        : report.ai
+                          ? "refined"
+                          : aiLifecycle[report.id] === "processing"
+                            ? "processing"
+                            : "raw"}
+                    </td>
+                    <td className="intel-table__time">{new Date(report.timestamp).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </section>
 
@@ -1486,32 +1749,25 @@ export default function App() {
               />
               </Suspense>
               <div className="map-overlay-card">
-                <span className="map-sidecar__title">Reality Layer</span>
-                <strong>{truthMode === "raw" ? "Raw chaos view" : "Filtered truth view"}</strong>
+                <strong>{truthMode === "raw" ? "Raw" : "Filtered"}</strong>
                 <p>
                   {showNasaLayer
-                    ? `NASA FIRMS active with ${nasaHotspots.length} hotspot signals.`
-                    : "Turn on NASA FIRMS to reconcile crowd reports with satellite evidence."}
+                    ? `FIRMS · ${nasaHotspots.length}`
+                    : "NASA off"}
                 </p>
               </div>
               {selectedZone && selectedDerivedZone ? (
                 <div className="map-detail-overlay">
-                  <span className="map-sidecar__title">Zone Authority</span>
                   <h3>{selectedZone.zone}</h3>
                   <p>
-                    Confidence <strong>{selectedDerivedZone.finalConfidence.toFixed(2)}</strong> · Urgency{" "}
-                    <strong>{selectedZone.urgencyScore.toFixed(2)}</strong>
-                  </p>
-                  <p>
-                    Decision <strong>{selectedDerivedZone.decision}</strong> · Conflict{" "}
-                    <strong>{selectedDerivedZone.conflictLevel}</strong>
+                    Conf <strong>{selectedDerivedZone.finalConfidence.toFixed(2)}</strong> · Urg <strong>{selectedZone.urgencyScore.toFixed(2)}</strong> · <strong>{selectedDerivedZone.decision}</strong> · {selectedDerivedZone.conflictLevel}
                   </p>
                   <button
                     className="overlay-link"
                     onClick={() => setSelectedReportId(selectedZone.reports[0]?.id ?? null)}
                     type="button"
                   >
-                    Open explainability
+                    Explain
                   </button>
                 </div>
               ) : null}
@@ -1581,15 +1837,24 @@ export default function App() {
           </div>
           <div className="detail-card detail-card--decomposition">
             <h3>Confidence Decomposition</h3>
-            <div className="decomposition-grid">
-              <span>Trust input</span>
-              <strong>{selectedReport?.trust.decayedTrust.toFixed(2) ?? "0.00"}</strong>
-              <span>NASA boost</span>
-              <strong>+{selectedDerivedZone?.nasaConfidence.toFixed(2) ?? "0.00"}</strong>
-              <span>Conflict drag</span>
-              <strong>-{Math.max(0, ((selectedReport?.trust.decayedTrust ?? 0) + (selectedDerivedZone?.nasaConfidence ?? 0) - (selectedDerivedZone?.finalConfidence ?? 0))).toFixed(2)}</strong>
-              <span>Decay factor</span>
-              <strong>x{(Math.exp(-0.02 * (selectedReport?.trust.minutesSinceReport ?? 0))).toFixed(2)}</strong>
+            <div className="decomposition-chain" style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", margin: "14px 0", fontSize: "1.1rem" }}>
+              <div style={{ padding: "8px", background: "rgba(255,138,76,0.1)", borderRadius: "8px" }}>
+                <span>Trust</span> <strong style={{ color: "#ff8a4c" }}>{selectedReport?.trust.decayedTrust.toFixed(2) ?? "0.00"}</strong>
+                <span style={{ fontSize: "0.8em", opacity: 0.7, marginLeft: "4px" }}>× {(selectedDerivedZone?.breakdown?.reportWeight ?? 0.5).toFixed(2)}</span>
+              </div>
+              <span className="decomposition-operator">+</span>
+              <div style={{ padding: "8px", background: "rgba(0,199,255,0.1)", borderRadius: "8px" }}>
+                <span>NASA</span> <strong style={{ color: "#00c7ff" }}>{selectedDerivedZone?.nasaConfidence.toFixed(2) ?? "0.00"}</strong>
+                <span style={{ fontSize: "0.8em", opacity: 0.7, marginLeft: "4px" }}>× {(selectedDerivedZone?.breakdown?.nasaWeight ?? 0).toFixed(2)}</span>
+              </div>
+              <span className="decomposition-operator">−</span>
+              <div style={{ padding: "8px", background: "rgba(255,95,87,0.1)", borderRadius: "8px" }}>
+                <span>Conflict</span> <strong style={{ color: "#ff5f57" }}>{(selectedDerivedZone?.breakdown?.conflictCount ?? 0) > 0 ? (selectedDerivedZone?.breakdown?.conflictPenalty ?? 0).toFixed(2) : "0.00"}</strong>
+              </div>
+              <span className="decomposition-operator" style={{ fontWeight: "bold", marginLeft: "8px" }}>=</span>
+              <div style={{ padding: "8px", background: "rgba(72,227,161,0.1)", borderRadius: "8px", border: "1px solid rgba(72,227,161,0.3)" }}>
+                <span>Final</span> <strong style={{ color: "#48e3a1", fontSize: "1.2em" }}>{selectedDerivedZone?.finalConfidence.toFixed(2) ?? "0.00"}</strong>
+              </div>
             </div>
             <p className="helper-text">{confidenceStory}</p>
           </div>
@@ -1623,7 +1888,11 @@ export default function App() {
                     ))}
                   </ul>
                 </div>
-                <AIPanel data={selectedReport.ai} />
+                <AIPanel
+                  data={selectedReport.ai}
+                  status={selectedAiStage}
+                  queuePosition={selectedAiStage === "queued" ? aiQueuePosition || null : null}
+                />
               </div>
             ) : null}
           </div>
@@ -1671,23 +1940,61 @@ export default function App() {
           ) : null}
           <div className="decision-stack">
             {recommendations.map((recommendation, index) => (
-              <button
+              <div
                 key={`${recommendation.zone}-${recommendation.rank}`}
                 className={`decision-card ${recommendation.flag ? "decision-card--alert" : ""} ${
                   decisionShiftZone === recommendation.zone ? "decision-card--shift" : ""
                 }`}
                 onClick={() => setSelectedZoneId(recommendation.zone)}
                 style={{ animationDelay: `${index * 70}ms` }}
-                type="button"
               >
                 <div className="decision-card__rank">#{recommendation.rank}</div>
                 <div className="decision-card__body">
-                  <strong>{displayDecisionAction(recommendation.action)}</strong>
-                  <span>{recommendation.zone}</span>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                    <div>
+                      <strong>{displayDecisionAction(recommendation.action)}</strong>
+                      <span>{recommendation.zone}</span>
+                    </div>
+                    <div className={scoreBadgeClass(recommendation.confidence)}>{recommendation.confidence}</div>
+                  </div>
                   <p>{recommendation.rationale}</p>
+                  
+                  {overrideTarget === recommendation.zone ? (
+                    <form className="override-form action-panel" onClick={(e) => e.stopPropagation()} onSubmit={(e) => handleOperatorAction(recommendation, "OVERRIDDEN", e)}>
+                      <p>Enter required reason for overriding system recommendation:</p>
+                      <input 
+                        type="text" 
+                        value={overrideReason} 
+                        onChange={(e) => setOverrideReason(e.target.value)} 
+                        placeholder="e.g. Visual confirmation differs"
+                        autoFocus
+                        style={{ width: "100%", marginBottom: "8px", padding: "6px", background: "rgba(0,0,0,0.4)", border: "1px solid #73c7ef", color: "#fff" }}
+                      />
+                      <div className="button-row">
+                        <button type="button" className="control-button" onClick={() => setOverrideTarget(null)}>Cancel</button>
+                        <button type="submit" className="control-button control-button--chaos">Submit Override</button>
+                      </div>
+                    </form>
+                  ) : (
+                    <div className="decision-card__actions" style={{ marginTop: "12px", display: "flex", gap: "8px" }}>
+                      <button 
+                        type="button" 
+                        className="control-button speed-pill--active" 
+                        onClick={(e) => handleOperatorAction(recommendation, "CONFIRMED", e)}
+                      >
+                        Confirm Dispatch
+                      </button>
+                      <button 
+                        type="button" 
+                        className="control-button" 
+                        onClick={(e) => { e.stopPropagation(); setOverrideTarget(recommendation.zone); }}
+                      >
+                        Override
+                      </button>
+                    </div>
+                  )}
                 </div>
-                <div className={scoreBadgeClass(recommendation.confidence)}>{recommendation.confidence}</div>
-              </button>
+              </div>
             ))}
           </div>
         </section>

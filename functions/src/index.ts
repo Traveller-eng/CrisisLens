@@ -50,7 +50,7 @@ function normalizeReport(id: string, raw: StoredReport): CrisisReport {
     id,
     source: String(raw.source ?? raw.sourceName ?? raw.sourceType ?? "Live source"),
     sourceType:
-      raw.sourceType === "verified_org" || raw.sourceType === "ngo" || raw.sourceType === "anonymous"
+      raw.sourceType === "verified_org" || raw.sourceType === "ngo" || raw.sourceType === "citizen" || raw.sourceType === "anonymous"
         ? raw.sourceType
         : "unknown",
     text: String(raw.text ?? raw.content ?? "Incoming report"),
@@ -261,6 +261,7 @@ async function writeDerivedState(reports: CrisisReport[], signals: NasaSignal[])
     const finalConfidence = fusion.finalConfidence;
     const decision = decide(finalConfidence);
     const zoneRef = zonesCollection.doc(zone.zone);
+    const conflictingReports = zone.reports.filter((report) => (report.contradictionSignals ?? 0) > 0 || report.claim === "negative");
     batch.set(zoneRef, {
       zoneId: zone.zone,
       center: { lat: zone.lat, lng: zone.lng },
@@ -278,6 +279,15 @@ async function writeDerivedState(reports: CrisisReport[], signals: NasaSignal[])
       needs: zone.dominantNeeds,
       conflictLevel: conflict > 0.66 ? "HIGH" : conflict > 0.33 ? "MEDIUM" : "LOW",
       affectedEstimate: zone.affectedEstimate,
+      breakdown: {
+        reportWeight: Number(fusion.weights.report.toFixed(3)),
+        nasaWeight: Number(fusion.weights.nasa.toFixed(3)),
+        weatherWeight: Number(fusion.weights.weather.toFixed(3)),
+        conflictPenalty: Number(fusion.conflictPenalty.toFixed(3)),
+        correlationAdjustments: fusion.correlationAdjustments,
+        conflictCount: conflictingReports.length,
+        nasaActive: zoneSignals.length > 0
+      },
       updatedAt: now.toISOString()
     });
   });
@@ -641,5 +651,22 @@ export const onReportWrite = onDocumentWritten("reports/{reportId}", async (even
       level: latestRecommendations[0].flag ? "alert" : "resolve",
       newValue: latestRecommendations[0].confidence
     });
+  }
+});
+
+import * as fs from "fs";
+import * as path from "path";
+
+export const fetchSuppressionMetric = onRequest({ cors: true, maxInstances: 10 }, async (req, res) => {
+  try {
+    const metricPath = path.join(__dirname, "../../tests/.last-metric.json");
+    if (fs.existsSync(metricPath)) {
+      const data = fs.readFileSync(metricPath, "utf8");
+      res.status(200).json(JSON.parse(data));
+    } else {
+      res.status(404).json({ error: "Metric not generated. Run npm run extract-metric" });
+    }
+  } catch (error) {
+    res.status(500).json({ error: String(error) });
   }
 });

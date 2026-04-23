@@ -3,6 +3,7 @@ import type { CrisisReport, ScoredReport, ToneType, TrustBreakdown, TrustState, 
 const sourcePriorMap: Record<SourceType, number> = {
   verified_org: 1,
   ngo: 0.8,
+  citizen: 0.55,
   unknown: 0.4,
   anonymous: 0.2
 };
@@ -68,6 +69,8 @@ export function scoreReport(report: CrisisReport, zoneReports: CrisisReport[], n
 
   if (sourcePrior >= 0.8) {
     reasons.push(`${report.sourceType === "verified_org" ? "Verified command/agency source" : "NGO source"} lifts baseline credibility to ${sourcePrior.toFixed(2)}.`);
+  } else if (report.sourceType === "citizen") {
+    reasons.push(`Citizen source starts with a moderate prior of ${sourcePrior.toFixed(2)} because it is direct field input but not yet institutionally verified.`);
   } else {
     reasons.push(`${report.sourceType === "anonymous" ? "Anonymous source" : "Unknown source"} starts with a low prior of ${sourcePrior.toFixed(2)} before corroboration.`);
   }

@@ -1,7 +1,7 @@
 import type { DocumentData, QueryDocumentSnapshot, Timestamp } from "firebase/firestore";
 import type { AIAnalysis, ClaimType, CrisisReport, CrisisType, NeedType, SourceType, ToneType } from "../../../shared/crisis";
 
-const validSourceTypes = new Set<SourceType>(["verified_org", "ngo", "unknown", "anonymous"]);
+const validSourceTypes = new Set<SourceType>(["verified_org", "ngo", "citizen", "unknown", "anonymous"]);
 const validTypes = new Set<CrisisType>(["flood", "injury", "infrastructure", "shelter"]);
 const validNeeds = new Set<NeedType>(["rescue", "medical", "food", "shelter"]);
 const validTones = new Set<ToneType>(["factual", "emotional", "exaggerated"]);

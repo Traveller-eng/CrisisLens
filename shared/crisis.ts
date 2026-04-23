@@ -1,4 +1,4 @@
-export type SourceType = "verified_org" | "ngo" | "unknown" | "anonymous";
+export type SourceType = "verified_org" | "ngo" | "citizen" | "unknown" | "anonymous";
 export type CrisisType = "flood" | "injury" | "infrastructure" | "shelter";
 export type NeedType = "rescue" | "medical" | "food" | "shelter";
 export type ToneType = "factual" | "emotional" | "exaggerated";

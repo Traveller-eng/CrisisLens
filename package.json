@@ -11,6 +11,7 @@
     "build": "npm run build --workspace web",
     "functions:build": "npm run build --workspace functions",
     "seed:firestore": "node functions/scripts/seed-firestore.mjs",
+    "extract-metric": "jest tests/metric-extraction.test.ts",
     "test": "jest --runInBand"
   },
   "devDependencies": {

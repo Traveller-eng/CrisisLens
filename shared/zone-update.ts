@@ -1,6 +1,16 @@
 import type { CrisisReport, NasaSignal } from "./crisis";
 import { computeFusedConfidence, conflictScore, decide, nasaConfidence, reportConfidence } from "./fusion";
 
+export type ZoneConfidenceBreakdown = {
+  reportWeight: number;
+  nasaWeight: number;
+  weatherWeight: number;
+  conflictPenalty: number;
+  correlationAdjustments: string[];
+  conflictCount: number;
+  nasaActive: boolean;
+};
+
 export type ZoneUpdateResult = {
   finalConfidence: number;
   conflictScore: number;
@@ -9,6 +19,7 @@ export type ZoneUpdateResult = {
   nasaConfidence: number;
   conflictPenalty: number;
   correlationAdjustments: string[];
+  breakdown: ZoneConfidenceBreakdown;
 };
 
 export function updateZone(_zoneId: string, reports: CrisisReport[], signals: NasaSignal[], now = Date.now()): ZoneUpdateResult {
@@ -20,6 +31,8 @@ export function updateZone(_zoneId: string, reports: CrisisReport[], signals: Na
     weatherSignal: 0
   });
 
+  const conflictingReports = reports.filter((report) => (report.contradictionSignals ?? 0) > 0 || report.claim === "negative");
+
   return {
     finalConfidence: fusion.finalConfidence,
     conflictScore: conflict,
@@ -27,6 +40,15 @@ export function updateZone(_zoneId: string, reports: CrisisReport[], signals: Na
     reportConfidence: crowdConfidence,
     nasaConfidence: signalConfidence,
     conflictPenalty: fusion.conflictPenalty,
-    correlationAdjustments: fusion.correlationAdjustments
+    correlationAdjustments: fusion.correlationAdjustments,
+    breakdown: {
+      reportWeight: fusion.weights.report,
+      nasaWeight: fusion.weights.nasa,
+      weatherWeight: fusion.weights.weather,
+      conflictPenalty: fusion.conflictPenalty,
+      correlationAdjustments: fusion.correlationAdjustments,
+      conflictCount: conflictingReports.length,
+      nasaActive: signalConfidence > 0
+    }
   };
 }

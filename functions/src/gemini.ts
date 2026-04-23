@@ -1,7 +1,7 @@
 import { onCall } from "firebase-functions/v2/https";
 import type { AIAnalysis, ClaimType, ContradictionSignal } from "../../shared/crisis";
 
-const GEMINI_MODEL = "gemini-2.0-flash";
+const GEMINI_MODEL = "gemini-2.0-flash-lite";
 
 function inferTypeFromText(text: string): AIAnalysis["type"] {
   const normalized = text.toLowerCase();
