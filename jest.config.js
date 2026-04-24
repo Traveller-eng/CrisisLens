@@ -13,5 +13,9 @@ module.exports = {
         }
       }
     ]
-  }
+  },
+  setupFilesAfterFramework: ["./tests/setup.ts"],
+  testTimeout: 15000,
+  verbose: true,
+  collectCoverage: false,
 };

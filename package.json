@@ -12,7 +12,11 @@
     "functions:build": "npm run build --workspace functions",
     "seed:firestore": "node functions/scripts/seed-firestore.mjs",
     "extract-metric": "jest tests/metric-extraction.test.ts",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "test:unit": "jest --runInBand --testPathPatterns unit",
+    "test:integration": "jest --runInBand --testPathPatterns integration",
+    "test:adversarial": "jest --runInBand --testPathPatterns adversarial --verbose",
+    "test:coverage": "jest --runInBand --coverage"
   },
   "devDependencies": {
     "@types/jest": "^30.0.0",

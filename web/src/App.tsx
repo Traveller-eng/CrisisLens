@@ -602,7 +602,7 @@ export default function App() {
   );
   const [chaosPending, setChaosPending] = useState(false);
   const [generatorPending, setGeneratorPending] = useState(false);
-  const [expandedAction, setExpandedAction] = useState<"crowd" | "verified" | "misinfo" | null>(null);
+  const [expandedAction, setExpandedAction] = useState<"crowd" | "verified" | "misinfo" | "attack" | null>(null);
   const [showNasaLayer, setShowNasaLayer] = useState(false);
   const [nasaHotspots, setNasaHotspots] = useState<NasaHotspot[]>([]);
   const [nasaLoading, setNasaLoading] = useState(false);
@@ -1269,6 +1269,90 @@ export default function App() {
     }
   }
 
+  async function simulateAdversarialAttack() {
+    const attackReports: CrisisReport[] = [
+      {
+        id: `attack-1-${Date.now()}`,
+        text: "Water is 3 feet high on Main Street, we need boats!",
+        source: "Citizen Reporter A",
+        sourceType: "citizen",
+        lat: 13.0835,
+        lng: 80.2715,
+        zone: "Zone A",
+        timestamp: new Date().toISOString(),
+        geminiOutput: { type: "flood", urgency: 0.85, needs: ["rescue"], tone: "emotional" },
+        contradictionSignals: 0,
+        claim: "positive"
+      },
+      {
+        id: `attack-2-${Date.now()}`,
+        text: "Flooding is severe on Main, cars are submerged.",
+        source: "Citizen Reporter B",
+        sourceType: "citizen",
+        lat: 13.0838,
+        lng: 80.2711,
+        zone: "Zone A",
+        timestamp: new Date(Date.now() + 800).toISOString(),
+        geminiOutput: { type: "flood", urgency: 0.82, needs: ["rescue"], tone: "factual" },
+        contradictionSignals: 0,
+        claim: "positive"
+      },
+      {
+        id: `attack-3-${Date.now()}`,
+        text: "Main Street is completely dry, no emergency here. False alarm everyone.",
+        source: "Anonymous Bot Account",
+        sourceType: "anonymous",
+        lat: 13.0831,
+        lng: 80.2718,
+        zone: "Zone A",
+        timestamp: new Date(Date.now() + 1600).toISOString(),
+        geminiOutput: { type: "flood", urgency: 0.12, needs: ["rescue"], tone: "factual" },
+        contradictionSignals: 3,
+        claim: "negative"
+      },
+      {
+        id: `attack-4-${Date.now()}`,
+        text: "Confirmed: water level rising near Main Street junction, rescue boats en route.",
+        source: "NDRF Field Unit",
+        sourceType: "verified_org",
+        lat: 13.0840,
+        lng: 80.2720,
+        zone: "Zone A",
+        timestamp: new Date(Date.now() + 2400).toISOString(),
+        geminiOutput: { type: "flood", urgency: 0.90, needs: ["rescue", "medical"], tone: "factual" },
+        contradictionSignals: 0,
+        claim: "positive"
+      },
+      {
+        id: `attack-5-${Date.now()}`,
+        text: "NGO team on ground at Main Street. People stranded on rooftops, water still rising.",
+        source: "RedCross Chennai",
+        sourceType: "ngo",
+        lat: 13.0833,
+        lng: 80.2708,
+        zone: "Zone A",
+        timestamp: new Date(Date.now() + 3200).toISOString(),
+        geminiOutput: { type: "flood", urgency: 0.88, needs: ["rescue", "shelter"], tone: "factual" },
+        contradictionSignals: 0,
+        claim: "positive"
+      }
+    ];
+
+    setChaosPending(true);
+    try {
+      pushLocalReports(attackReports);
+      pushLocalEvent({
+        id: `adversarial-attack-${Date.now()}`,
+        label: "\u26a0\ufe0f Adversarial attack simulated",
+        detail: "5 reports injected: 4 genuine flood signals + 1 bot contradiction. Watch the trust engine isolate the fake.",
+        tone: "alert"
+      });
+      attackReports.forEach((report) => startPipelineRun(report));
+    } finally {
+      setChaosPending(false);
+    }
+  }
+
   async function injectLocalSyntheticWave() {
     const reports: CrisisReport[] = Array.from({ length: 12 }, (_, index) => ({
       id: `local-wave-${Date.now()}-${index}`,
@@ -1615,6 +1699,15 @@ export default function App() {
               <span className="action-tab__icon">!</span>
               <strong>Misinfo</strong>
             </button>
+            <button
+              className={`action-tab action-tab--danger ${expandedAction === "attack" ? "action-tab--active" : ""}`}
+              disabled={chaosPending}
+              onClick={() => setExpandedAction((current) => (current === "attack" ? null : "attack"))}
+              type="button"
+            >
+              <span className="action-tab__icon">⚠</span>
+              <strong>Attack</strong>
+            </button>
           </div>
           {expandedAction === "crowd" ? (
             <div className="action-panel">
@@ -1637,6 +1730,14 @@ export default function App() {
               <p>Force a contradiction-heavy moment and watch trust shift live.</p>
               <button className="control-button control-button--chaos topbar-runner" disabled={chaosPending} onClick={injectChaos} type="button">
                 {chaosPending ? "Injecting..." : "Run Misinformation"}
+              </button>
+            </div>
+          ) : null}
+          {expandedAction === "attack" ? (
+            <div className="action-panel">
+              <p><strong>Orchestrated demo:</strong> 4 real flood reports + 1 bot contradiction. The AI catches and isolates the fake signal live.</p>
+              <button className="control-button control-button--chaos topbar-runner" disabled={chaosPending} onClick={simulateAdversarialAttack} type="button">
+                {chaosPending ? "Attacking..." : "⚠️ Simulate Attack"}
               </button>
             </div>
           ) : null}

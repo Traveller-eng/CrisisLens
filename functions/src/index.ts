@@ -1,6 +1,7 @@
 import { onDocumentWritten } from "firebase-functions/v2/firestore";
 import { onRequest } from "firebase-functions/v2/https";
 import { onSchedule } from "firebase-functions/v2/scheduler";
+import { onMessagePublished } from "firebase-functions/v2/pubsub";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import { demoReports, demoResources } from "../../shared/demo-data";
@@ -17,10 +18,15 @@ import {
   generateVerifiedCorrection
 } from "./data-flow";
 import { analyzeReport, analyzeReportText } from "./gemini";
+import { analyzeReportVertex } from "./vertexEngine";
+import { maskSensitiveData } from "./privacyEngine";
+import { PubSub } from "@google-cloud/pubsub";
 
 initializeApp();
 
 const db = getFirestore();
+const pubsub = new PubSub();
+const TOPIC_NAME = "emergency-reports-queue";
 
 type StoredReport = Record<string, unknown>;
 
@@ -563,7 +569,14 @@ export const onReportWrite = onDocumentWritten("reports/{reportId}", async (even
 
   if (after && !after.ai && typeof after.text === "string" && after.text.trim()) {
     try {
-      const ai = await analyzeReportText(after.text);
+      // Step 1: DLP Privacy Shield — strip PII before any AI processing
+      const safeText = await maskSensitiveData(after.text);
+
+      // Step 2: Vertex AI enterprise semantic analysis
+      const vertexResult = await analyzeReportVertex(safeText);
+
+      // Step 3: Gemini crisis classification pipeline
+      const ai = await analyzeReportText(safeText);
       const triage = {
         type: mapAiTypeToCrisisType(ai.type),
         urgency: ai.severity,
@@ -576,7 +589,8 @@ export const onReportWrite = onDocumentWritten("reports/{reportId}", async (even
         {
           ai,
           claim: ai.claim,
-          triage
+          triage,
+          vertexAnalysis: vertexResult
         },
         { merge: true }
       );
@@ -584,8 +598,8 @@ export const onReportWrite = onDocumentWritten("reports/{reportId}", async (even
       await appendEvent({
         type: "AI_ANALYSIS_COMPLETE",
         entity: `report:${reportId}`,
-        title: "AI structured output ready",
-        detail: `${ai.type} | confidence ${ai.confidence.toFixed(2)} | claim ${ai.claim}`,
+        title: "AI structured output ready (DLP → Vertex → Gemini)",
+        detail: `${ai.type} | confidence ${ai.confidence.toFixed(2)} | vertex credibility ${vertexResult.credibility ?? "N/A"} | risk: ${vertexResult.risk_flag ?? "unknown"}`,
         level: "resolve"
       });
     } catch (error) {
@@ -593,7 +607,7 @@ export const onReportWrite = onDocumentWritten("reports/{reportId}", async (even
         type: "AI_ANALYSIS_FAILED",
         entity: `report:${reportId}`,
         title: "AI analysis failed",
-        detail: error instanceof Error ? error.message.slice(0, 280) : "Unknown Gemini analysis error",
+        detail: error instanceof Error ? error.message.slice(0, 280) : "Unknown Gemini/Vertex analysis error",
         level: "alert"
       });
     }
@@ -668,5 +682,71 @@ export const fetchSuppressionMetric = onRequest({ cors: true, maxInstances: 10 }
     }
   } catch (error) {
     res.status(500).json({ error: String(error) });
+  }
+});
+
+/**
+ * THE SHOCK ABSORBER (Pub/Sub Ingestion Endpoint)
+ * The React frontend posts to this URL. It queues the message and returns immediately.
+ * Zero latency for the citizen — the heavy AI processing happens in the background.
+ */
+export const ingestReport = onRequest({ cors: true }, async (req, res) => {
+  try {
+    const reportData = req.body;
+
+    if (!reportData || !reportData.text) {
+      res.status(400).json({ error: "Report text is required." });
+      return;
+    }
+
+    const dataBuffer = Buffer.from(JSON.stringify(reportData));
+    await pubsub.topic(TOPIC_NAME).publishMessage({ data: dataBuffer });
+
+    res.status(200).json({
+      status: "queued",
+      message: "Report received and queued for secure AI processing."
+    });
+  } catch (error) {
+    console.error("Pub/Sub Ingestion Error:", error);
+    res.status(500).json({ error: "Failed to queue report." });
+  }
+});
+
+/**
+ * THE HEAVY LIFTER (Pub/Sub Background Worker)
+ * Automatically triggered by GCP when a new message hits the queue.
+ * Runs: DLP Privacy Shield → Vertex AI Semantic Analysis → Firestore Write
+ */
+export const processReportWorker = onMessagePublished(TOPIC_NAME, async (event) => {
+  try {
+    const rawMessage = event.data.message.json as { text?: string; location?: string };
+    console.log("Worker pulled report from queue:", rawMessage);
+
+    const rawText = rawMessage.text || "";
+
+    // Phase 1: Privacy Shield (Strip PII)
+    const safeText = await maskSensitiveData(rawText);
+    console.log("DLP Scrubbing complete.");
+
+    // Phase 2: Vertex AI Semantic Reasoning
+    const aiAnalysis = await analyzeReportVertex(safeText);
+    console.log("Vertex AI Analysis complete.", aiAnalysis);
+
+    // Phase 3: Action Execution (Save to Firestore — triggers onReportWrite for zone updates)
+    await db.collection("reports").add({
+      text: safeText,
+      source: "Pub/Sub Ingestion",
+      sourceType: "citizen",
+      location: rawMessage.location || "Unknown",
+      zone: rawMessage.location || "Zone A",
+      timestamp: new Date().toISOString(),
+      vertexAnalysis: aiAnalysis,
+      decision: (aiAnalysis.credibility > 0.8 && !aiAnalysis.risk_flag.includes("contradiction")) ? "DISPATCH" : "HOLD",
+      status: "processed"
+    });
+
+    console.log("Report fully processed and written to reality layer.");
+  } catch (error) {
+    console.error("Worker processing failed:", error);
   }
 });

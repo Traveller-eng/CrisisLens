@@ -5,9 +5,7 @@ type VoiceReporterProps = {
 };
 
 export default function VoiceReporter({ onSubmitReport }: VoiceReporterProps) {
-  const { isListening, transcript, startListening, stopListening, setTranscript, supported } = useSpeech();
-
-  if (!supported) return null;
+  const { isListening, transcript, startListening, stopListening, setTranscript } = useSpeech();
 
   const handleSubmit = () => {
     if (transcript.trim()) {
