@@ -327,6 +327,23 @@
 }
 
 /* ── Voice Reporter ── */
+
+.citizen-type-pill--active {
+  background: rgba(72, 227, 161, 0.16);
+  border-color: rgba(72, 227, 161, 0.4);
+  color: #48e3a1;
+}
+
+.citizen-shelter--selected {
+  border-color: rgba(124, 198, 255, 0.4);
+  background: rgba(124, 198, 255, 0.08);
+}
+
+.citizen-map-container .real-map {
+  height: 320px;
+  min-height: 280px;
+}
+
 .voice-reporter {
   margin-top: 18px;
   border-radius: 22px;

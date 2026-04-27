@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 // Extend Window to bypass TypeScript compiler errors for the native Speech API
 declare global {
@@ -14,57 +14,160 @@ interface UseSpeechReturn {
   startListening: () => void;
   stopListening: () => void;
   setTranscript: React.Dispatch<React.SetStateAction<string>>;
+  permissionState: 'prompt' | 'granted' | 'denied' | 'unsupported';
 }
 
 export const useSpeech = (): UseSpeechReturn => {
   const [isListening, setIsListening] = useState<boolean>(false);
   const [transcript, setTranscript] = useState<string>('');
-  const [recognition, setRecognition] = useState<any>(null);
+  const [permissionState, setPermissionState] = useState<'prompt' | 'granted' | 'denied' | 'unsupported'>('prompt');
+  const recognitionRef = useRef<any>(null);
+  const finalTranscriptRef = useRef<string>('');
 
+  // Check for SpeechRecognition support and mic permissions on mount
   useEffect(() => {
-    if (typeof window !== 'undefined' && ('SpeechRecognition' in window || 'webkitSpeechRecognition' in window)) {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      const rec = new SpeechRecognition();
-      
-      rec.continuous = true;
-      rec.interimResults = true;
-      rec.lang = 'en-IN'; 
+    if (typeof window === 'undefined') {
+      setPermissionState('unsupported');
+      return;
+    }
 
-      rec.onresult = (event: any) => {
-        let currentTranscript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          currentTranscript += event.results[i][0].transcript;
-        }
-        setTranscript(currentTranscript);
-      };
+    const hasSpeechApi = 'SpeechRecognition' in window || 'webkitSpeechRecognition' in window;
+    if (!hasSpeechApi) {
+      setPermissionState('unsupported');
+      return;
+    }
 
-      rec.onerror = (event: any) => {
-        console.error('Speech recognition error:', event.error);
-        setIsListening(false);
-      };
-
-      setRecognition(rec);
+    // Probe microphone permission state
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'microphone' as PermissionName })
+        .then((result) => {
+          setPermissionState(result.state === 'granted' ? 'granted' : result.state === 'denied' ? 'denied' : 'prompt');
+          result.addEventListener('change', () => {
+            setPermissionState(result.state === 'granted' ? 'granted' : result.state === 'denied' ? 'denied' : 'prompt');
+          });
+        })
+        .catch(() => {
+          // permissions.query not supported for microphone — stay as 'prompt'
+        });
     }
   }, []);
 
-  const startListening = useCallback(() => {
-    if (recognition) {
-      setTranscript(''); 
-      try {
-        recognition.start();
-        setIsListening(true);
-      } catch (e) {
-        console.error("Recognition error:", e);
+  // Build the recognition instance lazily so we can re-create after errors
+  const ensureRecognition = useCallback(() => {
+    if (recognitionRef.current) return recognitionRef.current;
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return null;
+
+    const rec = new SpeechRecognition();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = 'en-IN';
+
+    rec.onresult = (event: any) => {
+      let finalPart = '';
+      let interimPart = '';
+      for (let i = 0; i < event.results.length; i++) {
+        const result = event.results[i];
+        if (result.isFinal) {
+          finalPart += result[0].transcript;
+        } else {
+          interimPart += result[0].transcript;
+        }
       }
+      // Store the finalized portion so it persists
+      finalTranscriptRef.current = finalPart;
+      setTranscript(finalPart + interimPart);
+    };
+
+    rec.onerror = (event: any) => {
+      console.error('Speech recognition error:', event.error);
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        setPermissionState('denied');
+      }
+      setIsListening(false);
+      // Destroy the instance so we recreate a fresh one next time
+      recognitionRef.current = null;
+    };
+
+    rec.onend = () => {
+      // If we were listening and it auto-stopped (browser timeout), restart
+      // Otherwise leave it stopped
+      setIsListening(false);
+    };
+
+    recognitionRef.current = rec;
+    return rec;
+  }, []);
+
+  const startListening = useCallback(() => {
+    // If permission is denied, request it by calling getUserMedia
+    if (permissionState === 'denied') {
+      alert('Microphone access was denied. Please enable it in your browser settings and reload.');
+      return;
     }
-  }, [recognition]);
+
+    if (permissionState === 'unsupported') {
+      alert('Speech recognition is not supported in this browser. Please use Chrome or Edge.');
+      return;
+    }
+
+    // Request mic permission first if needed
+    const doStart = () => {
+      const rec = ensureRecognition();
+      if (!rec) return;
+      finalTranscriptRef.current = '';
+      setTranscript('');
+      try {
+        rec.start();
+        setIsListening(true);
+        setPermissionState('granted');
+      } catch (e: any) {
+        // If already running, abort and restart
+        if (e.message?.includes('already started')) {
+          rec.stop();
+          setTimeout(() => {
+            try {
+              rec.start();
+              setIsListening(true);
+            } catch (e2) {
+              console.error('Could not restart recognition:', e2);
+            }
+          }, 200);
+        } else {
+          console.error('Recognition start error:', e);
+        }
+      }
+    };
+
+    if (permissionState === 'prompt') {
+      // Trigger the browser permission prompt via getUserMedia
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then((stream) => {
+          // Permission granted — stop the stream (recognition uses its own)
+          stream.getTracks().forEach(t => t.stop());
+          setPermissionState('granted');
+          doStart();
+        })
+        .catch(() => {
+          setPermissionState('denied');
+          alert('Microphone access was denied. Voice input will not work.');
+        });
+    } else {
+      doStart();
+    }
+  }, [permissionState, ensureRecognition]);
 
   const stopListening = useCallback(() => {
-    if (recognition) {
-      recognition.stop();
-      setIsListening(false);
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // ignore
+      }
     }
-  }, [recognition]);
+    setIsListening(false);
+  }, []);
 
-  return { isListening, transcript, startListening, stopListening, setTranscript };
+  return { isListening, transcript, startListening, stopListening, setTranscript, permissionState };
 };
